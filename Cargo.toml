@@ -1,0 +1,9 @@
+[package]
+name = "aufhebung"
+version = "0.1.0"
+edition = "2024"
+description = "Zero-copy cursor operations on slices, accelerated with SIMD for bytes"
+keywords = ["slice", "cursor", "parser", "take", "scanning"]
+
+[dependencies]
+memchr = "2"
