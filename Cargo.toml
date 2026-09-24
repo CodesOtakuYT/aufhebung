@@ -2,8 +2,32 @@
 name = "aufhebung"
 version = "0.1.0"
 edition = "2024"
-description = "Zero-copy cursor operations on slices, accelerated with SIMD for bytes"
+description = "Zero-copy cursor operations on slices, accelerated with memchr for bytes"
 keywords = ["slice", "cursor", "parser", "take", "scanning"]
+autobenches = false
 
 [dependencies]
 memchr = "2"
+
+[dev-dependencies]
+atoi = "3"
+bstr = "1"
+btoi = "0.5"
+criterion = "0.5"
+httparse = "1"
+
+[[bench]]
+name = "http"
+harness = false
+
+[[bench]]
+name = "http_chunked"
+harness = false
+
+[[bench]]
+name = "int"
+harness = false
+
+[[bench]]
+name = "scan"
+harness = false
