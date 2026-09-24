@@ -22,11 +22,19 @@
 //! [`SliceCursor::split_on`] for generic predicates, plus the byte-specialized
 //! [`ByteSliceCursor::split_whitespace`] and
 //! [`ByteSliceCursor::split_bytes`] (SIMD-accelerated).
+//!
+//! [`ChunkedCursor`] extends the cursor pattern to a *stream* of slices
+//! (`&[&[T]]`), where scanning bridges chunk boundaries automatically. A span
+//! that crosses a chunk cannot be a single contiguous `&[T]`, so cross-boundary
+//! `take*` methods return a [`Pieces`] iterator — one zero-copy sub-slice per
+//! chunk touched — and [`ChunkedCursor::split_whitespace`] splits a chunked
+//! byte stream into [`Words`], each composed of its [`Pieces`].
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 use memchr::{memchr, memmem, memrchr};
+use std::iter::FusedIterator;
 
 /// Cursor operations over a generic slice.
 ///
@@ -651,3 +659,384 @@ impl<'a, 'p> Iterator for SplitBytes<'a, 'p> {
         }
     }
 }
+
+/// Zero-copy cursor over a *stream* of slices.
+///
+/// [`SliceCursor`] advances a plain `&'a [T]`; `ChunkedCursor` is the
+/// equivalent for input that arrives split across chunks (`&'a [&'a [T]]`): an
+/// element position is tracked as `(chunk index, offset inside that chunk)`,
+/// and scanning operations bridge chunk boundaries automatically. Empty chunks
+/// are treated as nothing and skipped.
+///
+/// One operation cannot be copied verbatim from [`SliceCursor`]: a `take*`
+/// method returns a single contiguous `&'a [T]`, and a span that crosses a
+/// chunk boundary has no contiguous representation. The chunked `take*`
+/// counterparts therefore return a zero-copy [`Pieces`] iterator with one
+/// `&'a [T]` per chunk the span touches (the first piece starts at the offset
+/// where the scan began; the last ends at the boundary that ended it). This is
+/// also why `ChunkedCursor` cannot itself implement [`SliceCursor`].
+///
+/// ```
+/// use aufhebung::{ByteSliceCursor, ChunkedCursor};
+///
+/// let mut input = ChunkedCursor::new(&[b"ab", b"c de", b"f"]);
+///
+/// let first: Vec<&[u8]> = input.take_until(|&b| b.is_ascii_whitespace()).collect();
+/// assert_eq!(first, [&b"ab"[..], &b"c"[..]]);
+/// assert_eq!(input.peek_byte(), Some(b' '));
+///
+/// let words: Vec<Vec<&[u8]>> = input
+///     .split_whitespace()
+///     .map(|w| w.collect())
+///     .collect();
+/// assert_eq!(words, [[&b"de"[..], &b"f"[..]]]);
+/// ```
+pub struct ChunkedCursor<'a, T> {
+    chunks: &'a [&'a [T]],
+    /// Index of the chunk currently pointed at.
+    idx: usize,
+    /// Offset within `chunks[idx]`; only meaningful while `idx < chunks.len()`.
+    pos: usize,
+}
+
+impl<'a, T> Clone for ChunkedCursor<'a, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'a, T> Copy for ChunkedCursor<'a, T> {}
+
+impl<'a, T> ChunkedCursor<'a, T> {
+    /// Build a cursor over a stream of chunks.
+    ///
+    /// The cursor starts at the first element of the first chunk; empty chunks
+    /// are skipped as the cursor advances.
+    #[inline]
+    pub fn new(chunks: &'a [&'a [T]]) -> Self {
+        Self {
+            chunks,
+            idx: 0,
+            pos: 0,
+        }
+    }
+
+    /// Advance past exhausted and empty chunks so the current chunk is
+    /// readable, or so that `idx` points past the end of the stream.
+    fn skip_exhausted(&mut self) {
+        while self.idx < self.chunks.len() && self.pos >= self.chunks[self.idx].len() {
+            self.idx += 1;
+            self.pos = 0;
+        }
+    }
+
+    /// Whether any elements remain in the stream.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        let mut cursor = *self;
+        cursor.skip_exhausted();
+        cursor.idx >= cursor.chunks.len()
+    }
+
+    /// Number of elements remaining in the stream, summed across chunks.
+    ///
+    /// Runs in time linear in the number of remaining chunks.
+    pub fn remaining(&self) -> usize {
+        let Some(first) = self.chunks.get(self.idx) else {
+            return 0;
+        };
+        first.len().saturating_sub(self.pos)
+            + self.chunks[self.idx + 1..]
+                .iter()
+                .map(|chunk| chunk.len())
+                .sum::<usize>()
+    }
+
+    /// Peek the current element without consuming it.
+    ///
+    /// Bridging to a later chunk if the current one is exhausted or empty.
+    pub fn peek(&self) -> Option<&'a T> {
+        let mut cursor = *self;
+        cursor.skip_exhausted();
+        let chunk = *cursor.chunks.get(cursor.idx)?;
+        chunk.get(cursor.pos)
+    }
+
+    /// Consume and discard elements while `pred` holds, bridging chunk
+    /// boundaries. Returns the number of elements skipped.
+    pub fn skip_while<F>(&mut self, mut pred: F) -> usize
+    where
+        F: FnMut(&T) -> bool,
+    {
+        let mut skipped = 0;
+        loop {
+            self.skip_exhausted();
+            if self.idx >= self.chunks.len() {
+                break;
+            }
+            let chunk = self.chunks[self.idx];
+            let mut cursor = &chunk[self.pos..];
+            let n = cursor.skip_while(&mut pred);
+            skipped += n;
+            self.pos += n;
+            if self.pos < chunk.len() {
+                break;
+            }
+        }
+        skipped
+    }
+
+    /// Consume and discard elements until `pred` matches, bridging chunk
+    /// boundaries. Returns the number of elements skipped; the cursor ends at
+    /// the first matching element (exclusive of the skip), or at the end of
+    /// the stream if none matches.
+    pub fn skip_until<F>(&mut self, mut pred: F) -> usize
+    where
+        F: FnMut(&T) -> bool,
+    {
+        let mut skipped = 0;
+        loop {
+            self.skip_exhausted();
+            if self.idx >= self.chunks.len() {
+                break;
+            }
+            let chunk = self.chunks[self.idx];
+            let mut cursor = &chunk[self.pos..];
+            let n = cursor.skip_until(&mut pred);
+            skipped += n;
+            self.pos += n;
+            if self.pos < chunk.len() {
+                break;
+            }
+        }
+        skipped
+    }
+
+    /// Split off everything before the first element matching `pred` and
+    /// return it as a zero-copy [`Pieces`] iterator, advancing the cursor to
+    /// the matching element.
+    ///
+    /// If no element matches, the pieces cover the whole remaining stream and
+    /// the cursor ends at the end of the stream. An immediate match yields an
+    /// empty [`Pieces`] iterator, mirroring the flat
+    /// [`take_until`](SliceCursor::take_until) returning an empty slice.
+    pub fn take_until<F>(&mut self, mut pred: F) -> Pieces<'a, T>
+    where
+        F: FnMut(&T) -> bool,
+    {
+        let start_idx = self.idx;
+        let start_pos = self.pos;
+        let mut end = *self;
+        end.skip_until(&mut pred);
+        self.idx = end.idx;
+        self.pos = end.pos;
+        Pieces::new(self.chunks, start_idx, start_pos, end.idx, end.pos)
+    }
+}
+
+impl<'a> ChunkedCursor<'a, u8> {
+    /// Peek the next byte without consuming it, bridging chunk boundaries.
+    #[inline]
+    pub fn peek_byte(&self) -> Option<u8> {
+        self.peek().copied()
+    }
+
+    /// Consume and return the next byte, bridging chunk boundaries.
+    pub fn next_byte(&mut self) -> Option<u8> {
+        self.skip_exhausted();
+        if self.idx >= self.chunks.len() {
+            return None;
+        }
+        let chunk = self.chunks[self.idx];
+        let byte = chunk[self.pos];
+        self.pos += 1;
+        Some(byte)
+    }
+
+    /// Split off everything before the first occurrence of `byte` and return
+    /// it as zero-copy [`Pieces`], advancing the cursor to the `byte`.
+    ///
+    /// Searching is memchr-accelerated within each chunk. If `byte` is absent,
+    /// the pieces cover the remaining stream.
+    pub fn take_until_byte(&mut self, byte: u8) -> Pieces<'a, u8> {
+        let start_idx = self.idx;
+        let start_pos = self.pos;
+        let mut end = *self;
+        end.skip_until_byte(byte);
+        self.idx = end.idx;
+        self.pos = end.pos;
+        Pieces::new(self.chunks, start_idx, start_pos, end.idx, end.pos)
+    }
+
+    /// Skip bytes until `byte` (exclusive of the byte), bridging chunks. The
+    /// cursor ends at the `byte`. Returns the number of bytes skipped.
+    ///
+    /// Searching is memchr-accelerated within each chunk.
+    pub fn skip_until_byte(&mut self, byte: u8) -> usize {
+        let mut skipped = 0;
+        loop {
+            self.skip_exhausted();
+            if self.idx >= self.chunks.len() {
+                break;
+            }
+            let chunk = self.chunks[self.idx];
+            let mut cursor = &chunk[self.pos..];
+            let n = cursor.skip_until_byte(byte);
+            skipped += n;
+            self.pos += n;
+            if self.pos < chunk.len() {
+                break;
+            }
+        }
+        skipped
+    }
+
+    /// Return an iterator over the ASCII-whitespace-separated words of the
+    /// remaining stream, where a word may span chunk boundaries.
+    ///
+    /// Each yielded item is a [`Pieces`] iterator over the zero-copy sub-slices
+    /// composing the word — one piece per chunk the word touches (empty chunks
+    /// are skipped). Whitespace runs are collapsed, mirroring
+    /// [`ByteSliceCursor::split_whitespace`] for a single contiguous slice.
+    ///
+    /// This is a non-consuming snapshot: the cursor keeps its position.
+    pub fn split_whitespace(&self) -> Words<'a> {
+        Words {
+            chunks: self.chunks,
+            idx: self.idx,
+            pos: self.pos,
+        }
+    }
+}
+
+/// Iterator over the zero-copy sub-slices of a span that crosses chunk
+/// boundaries.
+///
+/// Produced by [`ChunkedCursor::take_until`] (and
+/// [`ChunkedCursor::take_until_byte`]). A span touching several chunks has no
+/// single contiguous `&'a [T]`; instead it yields one `&'a [T]` per chunk the
+/// span touches: the first piece starts at the offset where the scan began,
+/// intermediate pieces are whole chunks, and the last piece ends at the
+/// boundary that ended the scan. Empty chunks in the middle of a span are
+/// skipped, so no empty piece is ever yielded. Implements
+/// [`ExactSizeIterator`], since the boundaries were fixed by the cursor.
+pub struct Pieces<'a, T> {
+    chunks: &'a [&'a [T]],
+    idx: usize,
+    pos: usize,
+    end_idx: usize,
+    end_pos: usize,
+    done: bool,
+    len: usize,
+}
+
+impl<'a, T> Clone for Pieces<'a, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'a, T> Copy for Pieces<'a, T> {}
+
+impl<'a, T> Pieces<'a, T> {
+    fn new(
+        chunks: &'a [&'a [T]],
+        start_idx: usize,
+        start_pos: usize,
+        end_idx: usize,
+        end_pos: usize,
+    ) -> Self {
+        let len = if start_idx == end_idx {
+            usize::from(start_pos < end_pos)
+        } else {
+            let middles = chunks[start_idx + 1..end_idx]
+                .iter()
+                .filter(|chunk| !chunk.is_empty())
+                .count();
+            1 + middles + usize::from(end_pos > 0)
+        };
+        Self {
+            chunks,
+            idx: start_idx,
+            pos: start_pos,
+            end_idx,
+            end_pos,
+            done: false,
+            len,
+        }
+    }
+}
+
+impl<'a, T> Iterator for Pieces<'a, T> {
+    type Item = &'a [T];
+
+    fn next(&mut self) -> Option<&'a [T]> {
+        if self.done {
+            return None;
+        }
+        let piece = if self.idx == self.end_idx {
+            if self.pos >= self.end_pos {
+                self.done = true;
+                return None;
+            }
+            self.done = true;
+            &self.chunks[self.idx][self.pos..self.end_pos]
+        } else {
+            let piece = &self.chunks[self.idx][self.pos..];
+            self.idx += 1;
+            self.pos = 0;
+            while self.idx < self.end_idx && self.chunks[self.idx].is_empty() {
+                self.idx += 1;
+            }
+            piece
+        };
+        self.len -= 1;
+        Some(piece)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.len, Some(self.len))
+    }
+}
+
+impl<'a, T> ExactSizeIterator for Pieces<'a, T> {
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+impl<'a, T> FusedIterator for Pieces<'a, T> {}
+
+/// Iterator over the ASCII-whitespace-separated words of a *chunked* byte
+/// stream, where words may span chunk boundaries.
+///
+/// Produced by [`ChunkedCursor::split_whitespace`]; each item is a [`Pieces`]
+/// iterator over the zero-copy sub-slices composing the word.
+#[derive(Clone, Copy)]
+pub struct Words<'a> {
+    chunks: &'a [&'a [u8]],
+    idx: usize,
+    pos: usize,
+}
+
+impl<'a> Iterator for Words<'a> {
+    type Item = Pieces<'a, u8>;
+
+    fn next(&mut self) -> Option<Pieces<'a, u8>> {
+        let mut cursor = ChunkedCursor {
+            chunks: self.chunks,
+            idx: self.idx,
+            pos: self.pos,
+        };
+        cursor.skip_while(u8::is_ascii_whitespace);
+        if cursor.is_empty() {
+            return None;
+        }
+        let pieces = cursor.take_until(u8::is_ascii_whitespace);
+        self.idx = cursor.idx;
+        self.pos = cursor.pos;
+        Some(pieces)
+    }
+}
+
+impl<'a> FusedIterator for Words<'a> {}
