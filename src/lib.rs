@@ -34,6 +34,7 @@
 #![warn(missing_docs)]
 
 use memchr::{memchr, memmem, memrchr};
+use std::hash::{Hash, Hasher};
 use std::iter::FusedIterator;
 
 /// Cursor operations over a generic slice.
@@ -930,6 +931,11 @@ impl<'a> ChunkedCursor<'a, u8> {
 /// boundary that ended the scan. Empty chunks in the middle of a span are
 /// skipped, so no empty piece is ever yielded. Implements
 /// [`ExactSizeIterator`], since the boundaries were fixed by the cursor.
+///
+/// Byte spans also behave like their contiguous contents without collecting:
+/// they compare with `==` (including against byte-string literals such as
+/// `b"GET"`), implement [`Hash`], and can be parsed with
+/// [`parse_integer`](Pieces::parse_integer).
 pub struct Pieces<'a, T> {
     chunks: &'a [&'a [T]],
     idx: usize,
@@ -1016,6 +1022,113 @@ impl<'a, T> ExactSizeIterator for Pieces<'a, T> {
 }
 
 impl<'a, T> FusedIterator for Pieces<'a, T> {}
+
+impl<'a> Pieces<'a, u8> {
+    /// Parse the span's bytes as a signed decimal integer.
+    ///
+    /// An optional leading `+` or `-` is accepted, followed by at least one
+    /// ASCII digit. Digits may straddle piece boundaries. Any other byte —
+    /// whitespace, or a sign anywhere but first — yields `None`, as do an
+    /// empty span and values outside [`i64`]'s range. Accumulation uses
+    /// checked arithmetic, so `i64::MIN` parses, while `i64::MAX + 1` and any
+    /// overflow return `None`. No allocation occurs.
+    ///
+    /// ```
+    /// use aufhebung::ChunkedCursor;
+    ///
+    /// let digits = ChunkedCursor::new(&[b"4", b"2!"]).take_until_byte(b'!');
+    /// assert_eq!(digits.parse_integer(), Some(42));
+    /// ```
+    pub fn parse_integer(&self) -> Option<i64> {
+        let it = *self;
+        let mut value: i128 = 0;
+        let mut has_digit = false;
+        let mut sign = false;
+        let mut negative = false;
+        for piece in it {
+            for &b in piece {
+                match b {
+                    b'+' | b'-' if !sign && !has_digit => {
+                        sign = true;
+                        negative = b == b'-';
+                    }
+                    b'0'..=b'9' => {
+                        has_digit = true;
+                        value = value.checked_mul(10)?.checked_add(i128::from(b - b'0'))?;
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        if !has_digit {
+            return None;
+        }
+        let value = if negative { -value } else { value };
+        i64::try_from(value).ok()
+    }
+}
+
+/// Element-wise equality of two piece sequences that may split the data
+/// differently (e.g. `["he", "llo"]` equals `["h", "ello"]`). Lead or tail
+/// slices of length zero (which `Pieces` itself never produces) are drained.
+fn span_bytes_eq<'a, 'b, A, B>(mut a: A, mut b: B) -> bool
+where
+    A: Iterator<Item = &'a [u8]>,
+    B: Iterator<Item = &'b [u8]>,
+{
+    let (mut ap, mut bp) = (a.next(), b.next());
+    loop {
+        match (ap, bp) {
+            (None, None) => return true,
+            (None, Some([])) => bp = b.next(),
+            (Some([]), None) => ap = a.next(),
+            (None, Some(_)) | (Some(_), None) => return false,
+            (Some(asl), Some(bsl)) => {
+                let n = asl.len().min(bsl.len());
+                if asl[..n] != bsl[..n] {
+                    return false;
+                }
+                ap = if asl.len() == n {
+                    a.next()
+                } else {
+                    Some(&asl[n..])
+                };
+                bp = if bsl.len() == n {
+                    b.next()
+                } else {
+                    Some(&bsl[n..])
+                };
+            }
+        }
+    }
+}
+
+impl<'a> PartialEq for Pieces<'a, u8> {
+    fn eq(&self, other: &Self) -> bool {
+        span_bytes_eq(*self, *other)
+    }
+}
+
+impl<'a, 'b, const N: usize> PartialEq<&'b [u8; N]> for Pieces<'a, u8> {
+    fn eq(&self, other: &&'b [u8; N]) -> bool {
+        span_bytes_eq(*self, std::iter::once(other.as_slice()))
+    }
+}
+
+impl<'a> Eq for Pieces<'a, u8> {}
+
+impl<'a> Hash for Pieces<'a, u8> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Mirror `Hash for [u8]` (and therefore `Vec<u8>`): a length prefix
+        // followed by the bytes in order, so hashing a `Pieces` span is
+        // identical to hashing the same bytes collected into one slice.
+        let len: usize = (*self).map(|piece| piece.len()).sum();
+        state.write_usize(len);
+        for piece in *self {
+            state.write(piece);
+        }
+    }
+}
 
 /// Iterator over the ASCII-whitespace-separated words of a *chunked* byte
 /// stream, where words may span chunk boundaries.

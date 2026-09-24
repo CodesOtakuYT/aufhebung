@@ -19,6 +19,11 @@ fn concatenate<'a>(pieces: impl Iterator<Item = &'a [u8]>) -> Vec<u8> {
     pieces.flat_map(|p| p.iter().copied()).collect()
 }
 
+/// The whole remaining stream as a [`Pieces`] span (no `\0` present).
+fn pieces<'a>(chunks: &'a [&'a [u8]]) -> aufhebung::Pieces<'a, u8> {
+    cursor(chunks).take_until_byte(b'\0')
+}
+
 #[test]
 fn split_whitespace_spans_chunks() {
     let chunks: &[&[u8]] = &[b"he", b"llo wo", b"rld par", b"t   two"];
@@ -332,4 +337,74 @@ fn generic_chunks_work_with_any_t() {
     assert_eq!(c.skip_while(|&x| x < 5), 2);
     assert_eq!(c.peek(), Some(&5));
     assert_eq!(c.remaining(), 1);
+}
+
+#[test]
+fn pieces_eq_ignores_chunk_layout() {
+    let a = pieces(&[b"he", b"llo"]);
+    let b = pieces(&[b"h", b"ello"]);
+
+    // split differently but same bytes
+    assert!(a == b);
+    assert!(b == a);
+    assert!(a == a);
+
+    // against byte-string literals
+    assert!(a == b"hello");
+    assert!(b == b"hello");
+    assert!(a != b"hallo");
+
+    // length mismatch
+    assert!(a != b"hellox");
+    assert!(pieces(&[]) != b"x");
+
+    // empty span == empty slice, regardless of empty chunks
+    assert!(pieces(&[]) == b"");
+    assert!(pieces(&[b"", b""]) == b"");
+    assert!(pieces(&[]) == pieces(&[b"", b""]));
+}
+
+#[test]
+fn pieces_hash_matches_collecting() {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut ha = DefaultHasher::new();
+    pieces(&[b"he", b"llo"]).hash(&mut ha);
+    let mut hb = DefaultHasher::new();
+    pieces(&[b"h", b"ello"]).hash(&mut hb);
+    assert_eq!(
+        ha.finish(),
+        hb.finish(),
+        "split layout must not affect the hash"
+    );
+
+    // equal to hashing the contiguous bytes
+    let mut hc = DefaultHasher::new();
+    b"hello".to_vec().hash(&mut hc);
+    assert_eq!(ha.finish(), hc.finish());
+}
+
+#[test]
+fn parse_integer_across_chunks() {
+    assert_eq!(pieces(&[b"4", b"2"]).parse_integer(), Some(42));
+    assert_eq!(pieces(&[b"-1", b"7"]).parse_integer(), Some(-17));
+    assert_eq!(pieces(&[b"+", b"3"]).parse_integer(), Some(3));
+    assert_eq!(pieces(&[b"-0"]).parse_integer(), Some(0));
+    assert_eq!(
+        pieces(&[b"-9223372036854775808"]).parse_integer(),
+        Some(i64::MIN)
+    );
+
+    assert_eq!(pieces(&[b"-"]).parse_integer(), None);
+    assert_eq!(pieces(&[b"+-"]).parse_integer(), None);
+    assert_eq!(pieces(&[b""]).parse_integer(), None);
+    assert_eq!(pieces(&[b"1", b"2-"]).parse_integer(), None);
+    assert_eq!(pieces(&[b" 1"]).parse_integer(), None);
+    assert_eq!(pieces(&[b"1 2"]).parse_integer(), None);
+    assert_eq!(pieces(&[b"9223372036854775808"]).parse_integer(), None);
+    assert_eq!(
+        pieces(&[b"99999999999999999999999999"]).parse_integer(),
+        None
+    );
 }
