@@ -34,6 +34,7 @@
 #![warn(missing_docs)]
 
 use memchr::{memchr, memmem, memrchr};
+use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::iter::FusedIterator;
 
@@ -1066,6 +1067,78 @@ impl<'a> Pieces<'a, u8> {
         let value = if negative { -value } else { value };
         i64::try_from(value).ok()
     }
+
+    /// Total number of bytes across the remaining pieces of the span.
+    ///
+    /// Zero-copy: sums the piece lengths in one pass without flattening the
+    /// span, and reflects the current iteration state (like [`Hash`]).
+    /// O(number of pieces), not O(bytes).
+    ///
+    /// ```
+    /// use aufhebung::ChunkedCursor;
+    ///
+    /// let span = ChunkedCursor::new(&[b"ab", b"cdef"]).take_until_byte(b'\0');
+    /// assert_eq!(span.byte_len(), 6);
+    /// ```
+    pub fn byte_len(&self) -> usize {
+        (*self).map(|piece| piece.len()).sum()
+    }
+
+    /// Whether the span's bytes begin with `prefix`.
+    ///
+    /// The prefix may straddle piece boundaries. An empty prefix always
+    /// matches, and a prefix longer than the span never does — mirroring
+    /// `[u8]::starts_with` for the contiguous case, but without materializing
+    /// the span. No allocation occurs.
+    ///
+    /// ```
+    /// use aufhebung::ChunkedCursor;
+    ///
+    /// let span = ChunkedCursor::new(&[b"HTT", b"P/1.1\r\n"]).take_until_byte(b'\r');
+    /// assert!(span.starts_with(b"HTTP/"));
+    /// ```
+    pub fn starts_with(&self, prefix: &[u8]) -> bool {
+        let mut rest = prefix;
+        for piece in *self {
+            let n = piece.len().min(rest.len());
+            if piece[..n] != rest[..n] {
+                return false;
+            }
+            rest = &rest[n..];
+            if rest.is_empty() {
+                return true;
+            }
+        }
+        rest.is_empty()
+    }
+
+    /// Copy the span's bytes into `dst`, in order, without allocating.
+    ///
+    /// Returns `Some(())` after writing the span into the first `byte_len()`
+    /// bytes of `dst`, leaving any tail of `dst` untouched. If `dst` is too
+    /// small, returns `None` and writes nothing — pair with [`Pieces::byte_len`]
+    /// to size a buffer exactly.
+    ///
+    /// ```
+    /// use aufhebung::ChunkedCursor;
+    ///
+    /// let span = ChunkedCursor::new(&[b"hel", b"lo"]).take_until_byte(b'\0');
+    /// let mut buf = [0u8; 5];
+    /// assert_eq!(span.copy_into(&mut buf), Some(()));
+    /// assert_eq!(&buf, b"hello");
+    /// ```
+    pub fn copy_into(&self, dst: &mut [u8]) -> Option<()> {
+        let len = self.byte_len();
+        if dst.len() < len {
+            return None;
+        }
+        let mut offset = 0;
+        for piece in *self {
+            dst[offset..offset + piece.len()].copy_from_slice(piece);
+            offset += piece.len();
+        }
+        Some(())
+    }
 }
 
 /// Element-wise equality of two piece sequences that may split the data
@@ -1122,11 +1195,23 @@ impl<'a> Hash for Pieces<'a, u8> {
         // Mirror `Hash for [u8]` (and therefore `Vec<u8>`): a length prefix
         // followed by the bytes in order, so hashing a `Pieces` span is
         // identical to hashing the same bytes collected into one slice.
-        let len: usize = (*self).map(|piece| piece.len()).sum();
+        let len = self.byte_len();
         state.write_usize(len);
         for piece in *self {
             state.write(piece);
         }
+    }
+}
+
+impl<'a> fmt::Display for Pieces<'a, u8> {
+    /// Print the span as lossy UTF-8, pieces in order — identical output to
+    /// displaying the concatenated bytes, with no allocation on the caller's
+    /// side.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for piece in *self {
+            f.write_str(&String::from_utf8_lossy(piece))?;
+        }
+        Ok(())
     }
 }
 

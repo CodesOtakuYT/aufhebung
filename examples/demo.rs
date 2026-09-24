@@ -6,8 +6,9 @@
 //!    cursor methods.
 //! 3. The same request delivered across three chunks, parsed with
 //!    [`ChunkedCursor`] — fields may straddle chunk boundaries, and the
-//!    `Pieces` value ops (`==`, `Hash`, `parse_integer`) are used directly on
-//!    the pieces without collecting.
+//!    `Pieces` value ops (`==`, `starts_with`, `Hash`, `parse_integer`,
+//!    `byte_len`, `Display`) are used directly on the pieces: fields are
+//!    validated and printed with no concatenation at all.
 //!
 //! Run with: `cargo run --example demo`
 
@@ -16,11 +17,6 @@ use aufhebung::{ByteSliceCursor, ChunkedCursor};
 /// Render a byte slice for display.
 fn as_str(s: &[u8]) -> String {
     String::from_utf8_lossy(s).into_owned()
-}
-
-/// Flatten an iterator of sub-slices into a new `[u8]` buffer.
-fn concat<'a>(pieces: impl Iterator<Item = &'a [u8]>) -> Vec<u8> {
-    pieces.flat_map(|p| p.iter().copied()).collect()
 }
 
 /// Read one CRLF (or bare-LF) terminated line, returned without its
@@ -105,12 +101,14 @@ fn main() {
     );
 
     for (n, pieces) in ChunkedCursor::new(chunks).split_whitespace().enumerate() {
-        let mut whole = Vec::new();
-        for piece in pieces {
-            whole.extend_from_slice(piece);
+        let word = pieces;
+        for piece in word {
             println!("  word {n}: piece {:?}", str::from_utf8(piece).unwrap());
         }
-        println!("word {n}: {:?}", str::from_utf8(&whole).unwrap());
+        // `Display` prints the whole word straight from the pieces — no
+        // `Vec`/`String` needed (the summary line that used to force a
+        // collect now prints the span directly).
+        println!("word {n}: {pieces}");
     }
 
     println!();
@@ -160,21 +158,14 @@ fn main() {
     c.next_byte(); // CR
     c.next_byte(); // LF
 
+    println!("request line: {method} {target} {version}");
     println!(
-        "request line: {} {} {}",
-        as_str(&concat(method)),
-        as_str(&concat(target)),
-        as_str(&concat(version))
-    );
-    println!(
-        "  method  {:?} (matches b\"POST\")     -> {}",
-        as_str(&concat(method)),
+        "  method  \"{method}\" (matches b\"POST\")  -> {}",
         method == b"POST"
     );
     println!(
-        "  version {:?} (matches b\"HTTP/1.1\") -> {}",
-        as_str(&concat(version)),
-        version == b"HTTP/1.1"
+        "  version \"{version}\" (starts with b\"HTTP/\") -> {}",
+        version.starts_with(b"HTTP/")
     );
     println!("  header fields:");
 
@@ -198,12 +189,16 @@ fn main() {
                 if name == b"Content-Length" {
                     declared_length = value.parse_integer();
                 }
-                println!("    {}: {}", as_str(&concat(name)), as_str(&concat(value)));
+                println!("    {name}: {value}");
             }
         }
     }
 
-    let body: Vec<u8> = concat(c.take_until(|_| false));
-    println!("  body: {:?} ({} bytes)", as_str(&body), body.len());
+    let body = c.take_until(|_| false);
+    println!("  body: \"{body}\" ({} bytes, zero-copy)", body.byte_len());
     println!("  Content-Length parsed straight from the pieces: {declared_length:?}");
+    println!(
+        "  Content-Length matches actual body length: {}",
+        declared_length == Some(body.byte_len() as i64)
+    );
 }

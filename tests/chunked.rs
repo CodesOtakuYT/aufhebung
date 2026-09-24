@@ -408,3 +408,84 @@ fn parse_integer_across_chunks() {
         None
     );
 }
+
+#[test]
+fn pieces_starts_with() {
+    let p = pieces(&[b"he", b"llo wo"]); // span: b"hello wo"
+
+    // prefixes straddling piece boundaries
+    assert!(p.starts_with(b"hel"));
+    assert!(p.starts_with(b"hello"));
+    assert!(p.starts_with(b"hello wo"));
+    assert!(p.starts_with(b""));
+
+    // longer than the span, or type mismatched
+    assert!(!p.starts_with(b"hello world"));
+    assert!(!p.starts_with(b"hallo"));
+    assert!(!p.starts_with(b"w"));
+
+    // empty spans
+    assert!(pieces(&[]).starts_with(b""));
+    assert!(!pieces(&[]).starts_with(b"x"));
+
+    // one piece per remaining chunk, empty chunks contribute nothing
+    let p = pieces(&[b"HTT", b"P/1.1\r\n"]);
+    assert!(p.starts_with(b"HTTP/"));
+    assert!(p.starts_with(b"HTT"));
+    assert!(!p.starts_with(b"HTTPS"));
+}
+
+#[test]
+fn pieces_byte_len() {
+    assert_eq!(pieces(&[b"ab", b"cde"]).byte_len(), 5);
+    assert_eq!(pieces(&[b"ab", b"", b"cde"]).byte_len(), 5); // empty chunks
+    assert_eq!(pieces(&[]).byte_len(), 0);
+    assert_eq!(pieces(&[b""]).byte_len(), 0);
+
+    // reflects partial consumption, like `Hash`
+    let mut p = pieces(&[b"ab", b"cde"]);
+    assert_eq!(p.byte_len(), 5);
+    p.next();
+    assert_eq!(p.byte_len(), 3);
+    p.next();
+    assert_eq!(p.byte_len(), 0);
+}
+
+#[test]
+fn pieces_copy_into() {
+    let p = pieces(&[b"he", b"llo"]);
+
+    // exact-fit buffer
+    let mut dst = [0u8; 5];
+    assert_eq!(p.copy_into(&mut dst), Some(()));
+    assert_eq!(&dst, b"hello");
+
+    // oversized buffer: span fills the front, tail untouched
+    let mut dst = [0xff; 8];
+    assert_eq!(p.copy_into(&mut dst), Some(()));
+    assert_eq!(&dst[..5], b"hello");
+    assert_eq!(&dst[5..], &[0xff; 3]);
+
+    // too small: None, and nothing is written
+    let mut dst = [0xaa; 4];
+    assert_eq!(p.copy_into(&mut dst), None);
+    assert_eq!(&dst, &[0xaa; 4]);
+
+    // empty span
+    let mut dst = [0xbb; 2];
+    assert_eq!(pieces(&[]).copy_into(&mut dst), Some(()));
+    assert_eq!(&dst, &[0xbb; 2]);
+}
+
+#[test]
+fn pieces_display() {
+    // identical to displaying the concatenated bytes
+    assert_eq!(pieces(&[b"he", b"llo"]).to_string(), "hello");
+    assert_eq!(pieces(&[]).to_string(), "");
+
+    // multi-byte UTF-8 split across pieces renders intact
+    assert_eq!(pieces(&[b"caf", b"\xC3\xA9"]).to_string(), "café");
+
+    // invalid bytes render lossily, like from_utf8_lossy
+    assert_eq!(pieces(&[b"a\xFFb"]).to_string(), "a\u{FFFD}b");
+}
