@@ -17,6 +17,11 @@
 //! original input and advances an in-place `&mut &[T]` cursor. Byte-oriented
 //! scanning ([`ByteSliceCursor`]) is accelerated with
 //! [`memchr`](https://docs.rs/memchr)'s SIMD routines.
+//!
+//! The cursor methods also compose into zero-copy segmenting iterators:
+//! [`SliceCursor::split_on`] for generic predicates, plus the byte-specialized
+//! [`ByteSliceCursor::split_whitespace`] and
+//! [`ByteSliceCursor::split_bytes`] (SIMD-accelerated).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -135,7 +140,7 @@ pub trait SliceCursor<'a, T> {
     /// If the cursor starts with `prefix`, consume it and return the consumed
     /// slice; otherwise return `None` and leave the cursor unchanged.
     ///
-    /// This differs from the inherent [`slice::strip_prefix`], which returns
+    /// This differs from the inherent `<[T]>::strip_prefix`, which returns
     /// the *remainder* without consuming — `take_prefix` consumes the prefix
     /// from the cursor and returns what was taken, mirroring [`take`](Self::take).
     fn take_prefix(&mut self, prefix: &[T]) -> Option<&'a [T]>
@@ -155,6 +160,17 @@ pub trait SliceCursor<'a, T> {
 
     /// Number of elements left in the cursor.
     fn remaining(&self) -> usize;
+
+    /// Return an iterator over the sub-slices between elements matching
+    /// `split`, mirroring the inherent `<[T]>::split` but as a non-consuming
+    /// snapshot of the cursor.
+    ///
+    /// Each separator element is consumed by the iterator; consecutive
+    /// separators yield empty segments, and a trailing separator yields no
+    /// trailing empty segment.
+    fn split_on<F>(&self, split: F) -> SplitOn<'a, T, F>
+    where
+        F: FnMut(&T) -> bool;
 }
 
 impl<'a, T> SliceCursor<'a, T> for &'a [T] {
@@ -324,6 +340,14 @@ impl<'a, T> SliceCursor<'a, T> for &'a [T] {
     fn remaining(&self) -> usize {
         self.len()
     }
+
+    #[inline]
+    fn split_on<F>(&self, split: F) -> SplitOn<'a, T, F>
+    where
+        F: FnMut(&T) -> bool,
+    {
+        SplitOn::new(self, split)
+    }
 }
 
 /// [`SliceCursor`] specializations for `&'a [u8]`.
@@ -380,6 +404,22 @@ pub trait ByteSliceCursor<'a>: SliceCursor<'a, u8> {
     /// If the cursor starts with `byte`, consume it and return `true`;
     /// otherwise leave the cursor unchanged and return `false`.
     fn skip_byte(&mut self, byte: u8) -> bool;
+
+    /// Return an iterator over the ASCII-whitespace-separated words of the
+    /// remaining input, mirroring [`str::split_whitespace`] but for `&[u8]`.
+    ///
+    /// Runs of whitespace are collapsed: leading/trailing whitespace and
+    /// consecutive separators never produce empty words.
+    fn split_whitespace(&self) -> SplitWhitespace<'a>;
+
+    /// Return an iterator over the sub-slices between occurrences of
+    /// `pattern`, mirroring the semantics of [`str::split`].
+    ///
+    /// Searching is accelerated with a precomputed **memmem** `Finder`
+    /// (SIMD-optimized by memchr). Consecutive occurrences yield empty
+    /// segments; a trailing occurrence yields no trailing empty segment.
+    /// Panics if `pattern` is empty.
+    fn split_bytes<'p>(&self, pattern: &'p [u8]) -> SplitBytes<'a, 'p>;
 }
 
 impl<'a> ByteSliceCursor<'a> for &'a [u8] {
@@ -488,6 +528,126 @@ impl<'a> ByteSliceCursor<'a> for &'a [u8] {
             true
         } else {
             false
+        }
+    }
+
+    #[inline]
+    fn split_whitespace(&self) -> SplitWhitespace<'a> {
+        SplitWhitespace::new(self)
+    }
+
+    #[inline]
+    fn split_bytes<'p>(&self, pattern: &'p [u8]) -> SplitBytes<'a, 'p> {
+        SplitBytes::new(self, pattern)
+    }
+}
+
+/// Iterator over the ASCII-whitespace-separated words of a byte slice.
+///
+/// Produced by [`ByteSliceCursor::split_whitespace`] and mirroring
+/// [`str::split_whitespace`]: yields non-empty, zero-copy sub-slices, with
+/// runs of whitespace collapsed.
+pub struct SplitWhitespace<'a> {
+    input: &'a [u8],
+}
+
+impl<'a> SplitWhitespace<'a> {
+    fn new(input: &'a [u8]) -> Self {
+        Self { input }
+    }
+}
+
+impl<'a> Iterator for SplitWhitespace<'a> {
+    type Item = &'a [u8];
+
+    #[inline]
+    fn next(&mut self) -> Option<&'a [u8]> {
+        self.input.skip_while(u8::is_ascii_whitespace);
+        if self.input.is_empty() {
+            None
+        } else {
+            Some(self.input.take_until(u8::is_ascii_whitespace))
+        }
+    }
+}
+
+/// Iterator over the sub-slices of a slice separated by elements matching a
+/// predicate.
+///
+/// Produced by [`SliceCursor::split_on`] and mirroring the inherent
+/// `<[T]>::split`: each separator element is consumed, consecutive separators
+/// yield empty segments, and a trailing separator yields no trailing empty
+/// segment.
+pub struct SplitOn<'a, T, F> {
+    input: &'a [T],
+    split: F,
+}
+
+impl<'a, T, F> SplitOn<'a, T, F> {
+    fn new(input: &'a [T], split: F) -> Self {
+        Self { input, split }
+    }
+}
+
+impl<'a, T, F: FnMut(&T) -> bool> Iterator for SplitOn<'a, T, F> {
+    type Item = &'a [T];
+
+    #[inline]
+    fn next(&mut self) -> Option<&'a [T]> {
+        if self.input.is_empty() {
+            return None;
+        }
+        let segment = self.input.take_until(&mut self.split);
+        if !self.input.is_empty() {
+            self.input.advance(1);
+        }
+        Some(segment)
+    }
+}
+
+/// Iterator over the sub-slices of a byte slice separated by a byte pattern.
+///
+/// Produced by [`ByteSliceCursor::split_bytes`] and mirroring the semantics of
+/// [`str::split`]: consecutive occurrences yield empty segments, and a
+/// trailing occurrence yields no trailing empty segment. Searching uses a
+/// precomputed **memmem** `Finder`, so repeated searches are SIMD-accelerated.
+/// The pattern must be non-empty.
+pub struct SplitBytes<'a, 'p> {
+    input: &'a [u8],
+    finder: memmem::Finder<'p>,
+    pattern_len: usize,
+}
+
+impl<'a, 'p> SplitBytes<'a, 'p> {
+    fn new(input: &'a [u8], pattern: &'p [u8]) -> Self {
+        assert!(!pattern.is_empty(), "split_bytes: empty pattern");
+        Self {
+            input,
+            finder: memmem::Finder::new(pattern),
+            pattern_len: pattern.len(),
+        }
+    }
+}
+
+impl<'a, 'p> Iterator for SplitBytes<'a, 'p> {
+    type Item = &'a [u8];
+
+    #[inline]
+    fn next(&mut self) -> Option<&'a [u8]> {
+        if self.input.is_empty() {
+            return None;
+        }
+        match self.finder.find(self.input) {
+            Some(pos) => {
+                let (segment, rest) = self.input.split_at(pos);
+                self.input = &rest[self.pattern_len..];
+                Some(segment)
+            }
+            None => {
+                let segment = self.input;
+                self.input = &[];
+                Some(segment)
+            }
         }
     }
 }
@@ -877,5 +1037,91 @@ mod tests {
             words,
             vec![&b"the"[..], &b"quick"[..], &b"brown"[..], &b"fox"[..]]
         );
+    }
+
+    // ---- Segmenting iterators ----
+
+    #[test]
+    fn split_on_mirrors_slice_split() {
+        let s: &[u8] = b"a,b,,c";
+        let parts: Vec<&[u8]> = s.split_on(|&b| b == b',').collect();
+        assert_eq!(parts, vec![&b"a"[..], &b"b"[..], &b""[..], &b"c"[..]]);
+    }
+
+    #[test]
+    fn split_on_leading_and_trailing_separators() {
+        let s: &[u8] = b",a,";
+        let parts: Vec<&[u8]> = s.split_on(|&b| b == b',').collect();
+        // leading separator -> empty first segment; trailing -> no empty tail
+        assert_eq!(parts, vec![&b""[..], &b"a"[..]]);
+    }
+
+    #[test]
+    fn split_on_no_separator_yields_whole() {
+        let s: &[u8] = b"abc";
+        let parts: Vec<&[u8]> = s.split_on(|&b| b == b',').collect();
+        assert_eq!(parts, vec![&b"abc"[..]]);
+    }
+
+    #[test]
+    fn split_on_non_byte_type() {
+        let s: &[i32] = &[0, 1, 2, 0, 3];
+        let parts: Vec<&[i32]> = s.split_on(|&x| x == 0).collect();
+        assert_eq!(parts, vec![&[][..], &[1, 2][..], &[3][..]]);
+    }
+
+    #[test]
+    fn split_on_does_not_advance_cursor() {
+        let s: &[u8] = b"a,b";
+        let parts: Vec<&[u8]> = s.split_on(|&b| b == b',').collect();
+        assert_eq!(parts, vec![&b"a"[..], &b"b"[..]]);
+        assert_eq!(s, b"a,b");
+    }
+
+    #[test]
+    fn split_whitespace_words() {
+        let s: &[u8] = b"  hello \t world!\n";
+        let parts: Vec<&[u8]> = s.split_whitespace().collect();
+        assert_eq!(parts, vec![&b"hello"[..], &b"world!"[..]]);
+    }
+
+    #[test]
+    fn split_whitespace_whitespace_only() {
+        let s: &[u8] = b"\t \n  ";
+        assert_eq!(s.split_whitespace().count(), 0);
+    }
+
+    #[test]
+    fn split_whitespace_empty() {
+        let s: &[u8] = b"";
+        assert_eq!(s.split_whitespace().count(), 0);
+    }
+
+    #[test]
+    fn split_bytes_multi_byte_pattern() {
+        let s: &[u8] = b"a\r\nb\r\nc";
+        let parts: Vec<&[u8]> = s.split_bytes(b"\r\n").collect();
+        assert_eq!(parts, vec![&b"a"[..], &b"b"[..], &b"c"[..]]);
+    }
+
+    #[test]
+    fn split_bytes_consecutive_patterns() {
+        let s: &[u8] = b"a,,b";
+        let parts: Vec<&[u8]> = s.split_bytes(b",").collect();
+        assert_eq!(parts, vec![&b"a"[..], &b""[..], &b"b"[..]]);
+    }
+
+    #[test]
+    fn split_bytes_no_match_yields_whole() {
+        let s: &[u8] = b"abc";
+        let parts: Vec<&[u8]> = s.split_bytes(b"zz").collect();
+        assert_eq!(parts, vec![&b"abc"[..]]);
+    }
+
+    #[test]
+    #[should_panic(expected = "split_bytes: empty pattern")]
+    fn split_bytes_empty_pattern_panics() {
+        let s: &[u8] = b"abc";
+        let _ = s.split_bytes(b"");
     }
 }

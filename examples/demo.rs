@@ -1,43 +1,17 @@
 //! The original `hello world!` demonstration, rewritten with trait methods,
-//! plus a `split_whitespace` iterator built on top of the cursor API.
+//! plus word splitting via the library's `split_whitespace` iterator.
 //!
 //! Run with: `cargo run --example demo`
 
-use aufhebung::SliceCursor;
-
-/// Iterator over the ASCII-whitespace-separated words of a byte slice.
-///
-/// Yields borrowed sub-slices (zero-copy). Mirrors [`str::split_whitespace`]
-/// but for `&[u8]`.
-struct SplitWhitespace<'a> {
-    input: &'a [u8],
-}
-
-impl<'a> Iterator for SplitWhitespace<'a> {
-    type Item = &'a [u8];
-
-    fn next(&mut self) -> Option<&'a [u8]> {
-        self.input.skip_while(u8::is_ascii_whitespace);
-        if self.input.remaining() == 0 {
-            None
-        } else {
-            Some(self.input.take_until(u8::is_ascii_whitespace))
-        }
-    }
-}
-
-/// Split `input` on ASCII whitespace, returning an iterator over the words.
-fn split_whitespace(input: &[u8]) -> SplitWhitespace<'_> {
-    SplitWhitespace { input }
-}
+use aufhebung::ByteSliceCursor;
 
 fn main() {
     let x: &[u8] = b"  hello \t world!\n";
 
-    for word in split_whitespace(x) {
+    for word in x.split_whitespace() {
         println!("{:?}", str::from_utf8(word).unwrap());
     }
 
-    let words: Vec<&[u8]> = split_whitespace(x).collect();
+    let words: Vec<&[u8]> = x.split_whitespace().collect();
     dbg!(words);
 }
