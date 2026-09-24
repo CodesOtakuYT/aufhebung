@@ -1,7 +1,7 @@
 //! Integration tests for the chunked cursor: `ChunkedCursor`, with its
 //! `Pieces` and `Words` iterators, over a stream of slices (`&[&[T]]`).
 
-use aufhebung::{ByteSliceCursor, ChunkedCursor};
+use aufhebung::{ByteSliceCursor, ChunkedCursor, SliceCursor};
 
 fn cursor<'a>(chunks: &'a [&'a [u8]]) -> ChunkedCursor<'a, u8> {
     ChunkedCursor::new(chunks)
@@ -252,6 +252,73 @@ fn skip_until_byte_bridges_chunks() {
     let mut c = cursor(chunks);
     assert_eq!(c.skip_until_byte(b' '), 3);
     assert_eq!(c.peek_byte(), Some(b' '));
+}
+
+/// `take_until` on a mis-aligned cursor (leading empty/exhausted chunks) must
+/// normalize the start: no empty leading piece, and the pieces must match the
+/// flat `take_until` of the same data concatenated into one slice.
+#[test]
+fn take_until_normalizes_start() {
+    let cases: [&[&[u8]]; 6] = [
+        &[],
+        &[b""],
+        &[b"", b"hello"],
+        &[b"hello", b""],
+        &[b"", b"hello", b""],
+        &[b"", b"", b"hello"],
+    ];
+    for case in cases {
+        let combined: Vec<u8> = case.iter().flat_map(|c| c.iter().copied()).collect();
+        let mut flat: &[u8] = &combined;
+        let flat_taken = flat.take_until(|&b| b == b'o');
+
+        let mut c = cursor(case);
+        let pieces: Vec<&[u8]> = c.take_until(|&b| b == b'o').collect();
+
+        assert!(
+            pieces.iter().all(|p| !p.is_empty()),
+            "case {case:?}: empty piece yielded"
+        );
+        assert_eq!(concatenate(pieces.into_iter()), flat_taken, "case {case:?}");
+        assert_eq!(c.peek_byte(), flat.peek_byte(), "case {case:?}");
+    }
+}
+
+/// Same as [`take_until_normalizes_start`], through the memchr-accelerated
+/// `take_until_byte`.
+#[test]
+fn take_until_byte_normalizes_start() {
+    let cases: [&[&[u8]]; 6] = [
+        &[],
+        &[b""],
+        &[b"", b"hello"],
+        &[b"hello", b""],
+        &[b"", b"hello", b""],
+        &[b"", b"", b"hello"],
+    ];
+    for case in cases {
+        let combined: Vec<u8> = case.iter().flat_map(|c| c.iter().copied()).collect();
+        let mut flat: &[u8] = &combined;
+        let flat_taken = flat.take_until_byte(b'o');
+
+        let mut c = cursor(case);
+        let pieces: Vec<&[u8]> = c.take_until_byte(b'o').collect();
+
+        assert!(
+            pieces.iter().all(|p| !p.is_empty()),
+            "case {case:?}: empty piece yielded"
+        );
+        assert_eq!(concatenate(pieces.into_iter()), flat_taken, "case {case:?}");
+        assert_eq!(c.peek_byte(), flat.peek_byte(), "case {case:?}");
+    }
+}
+
+/// `split_whitespace` must tolerate leading, trailing, and in-stream empty
+/// chunks without producing empty words or empty pieces.
+#[test]
+fn split_whitespace_with_empty_chunks_everywhere() {
+    let chunks: &[&[u8]] = &[b"", b"", b"  hi ", b"", b"yo  ", b""];
+    assert_eq!(words(chunks), vec![vec![&b"hi"[..]], vec![&b"yo"[..]]]);
 }
 
 #[test]

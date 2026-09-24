@@ -820,10 +820,15 @@ impl<'a, T> ChunkedCursor<'a, T> {
     /// the cursor ends at the end of the stream. An immediate match yields an
     /// empty [`Pieces`] iterator, mirroring the flat
     /// [`take_until`](SliceCursor::take_until) returning an empty slice.
+    ///
+    /// The starting position is normalized first: if the cursor points into an
+    /// exhausted or empty chunk, both the span and the cursor begin at the
+    /// first readable element, so no empty leading piece is produced.
     pub fn take_until<F>(&mut self, mut pred: F) -> Pieces<'a, T>
     where
         F: FnMut(&T) -> bool,
     {
+        self.skip_exhausted();
         let start_idx = self.idx;
         let start_pos = self.pos;
         let mut end = *self;
@@ -858,7 +863,12 @@ impl<'a> ChunkedCursor<'a, u8> {
     ///
     /// Searching is memchr-accelerated within each chunk. If `byte` is absent,
     /// the pieces cover the remaining stream.
+    ///
+    /// Like [`take_until`](Self::take_until), the starting position is
+    /// normalized first, so a leading exhausted or empty chunk produces no
+    /// empty leading piece.
     pub fn take_until_byte(&mut self, byte: u8) -> Pieces<'a, u8> {
+        self.skip_exhausted();
         let start_idx = self.idx;
         let start_pos = self.pos;
         let mut end = *self;
