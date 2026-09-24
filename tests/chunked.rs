@@ -2,6 +2,7 @@
 //! `Pieces` and `Words` iterators, over a stream of slices (`&[&[T]]`).
 
 use aufhebung::{ByteSliceCursor, ChunkedCursor, SliceCursor};
+use std::iter::ExactSizeIterator;
 
 fn cursor<'a>(chunks: &'a [&'a [u8]]) -> ChunkedCursor<'a, u8> {
     ChunkedCursor::new(chunks)
@@ -559,4 +560,79 @@ fn skip_while_any_skips_across_boundary() {
     let mut c = cursor(&[b" \t"]);
     assert_eq!(c.skip_while_any(b" \t"), 2);
     assert!(c.is_empty());
+}
+
+// ---- Pieces ExactSizeIterator: span geometry ----
+
+#[test]
+fn pieces_len_zero_when_span_is_empty() {
+    // start == end: the delimiter is at the current position
+    let mut pieces = cursor(&[b",x"]).take_until_byte(b',');
+    assert_eq!(pieces.len(), 0);
+    assert!(pieces.next().is_none());
+
+    // all-empty input, empty chunks only
+    let pieces = cursor(&[b"", b""]).take_rest();
+    assert_eq!(pieces.len(), 0);
+
+    // no chunks at all
+    let pieces = cursor(&[]).take_rest();
+    assert_eq!(pieces.len(), 0);
+}
+
+#[test]
+fn pieces_len_one_within_a_single_chunk() {
+    // start < end in the same chunk
+    let pieces = cursor(&[b"abcd"]).take_until_byte(b'c');
+    assert_eq!(pieces.len(), 1);
+    assert_eq!(concatenate(pieces), b"ab");
+
+    // span ending exactly at the end of a chunk (delimiter is its last byte)
+    let pieces = cursor(&[b"ab,c", b"d"]).take_until_byte(b',');
+    assert_eq!(pieces.len(), 1);
+    assert_eq!(concatenate(pieces), b"ab");
+}
+
+#[test]
+fn pieces_len_across_chunks() {
+    // delimiter at the start of the next chunk: the end_pos == 0 branch
+    let pieces = cursor(&[b"ab", b",cd"]).take_until_byte(b',');
+    assert_eq!(pieces.len(), 1);
+    assert_eq!(concatenate(pieces), b"ab");
+
+    // a non-empty middle chunk contributes one piece each
+    let pieces = cursor(&[b"a", b"bc", b"d,"]).take_until_byte(b',');
+    assert_eq!(pieces.len(), 3);
+    assert_eq!(concatenate(pieces), b"abcd");
+}
+
+#[test]
+fn pieces_len_skips_empty_middle_chunks() {
+    // an empty chunk between pieces neither counts nor yields
+    let pieces = cursor(&[b"a", b"", b"b,"]).take_until_byte(b',');
+    assert_eq!(pieces.len(), 2);
+    assert_eq!(concatenate(pieces), b"ab");
+
+    // the exact length stays truthful under iteration
+    assert_eq!(pieces.len(), pieces.count());
+}
+
+#[test]
+fn pieces_exact_len_agrees_with_count() {
+    let same_chunk: &[&[u8]] = &[b"abcd"];
+    let next_chunk_start: &[&[u8]] = &[b"ab", b",cd"];
+    let empty_middle: &[&[u8]] = &[b"a", b"", b"b,"];
+    let full_middle: &[&[u8]] = &[b"a", b"bc", b"d,"];
+    let at_cursor: &[&[u8]] = &[b",x"];
+    let cases: [(&[&[u8]], u8); 5] = [
+        (same_chunk, b'c'),
+        (next_chunk_start, b','),
+        (empty_middle, b','),
+        (full_middle, b','),
+        (at_cursor, b','),
+    ];
+    for &(chunks, delim) in &cases {
+        let pieces = cursor(chunks).take_until_byte(delim);
+        assert_eq!(pieces.len(), pieces.count(), "chunks={chunks:?}");
+    }
 }

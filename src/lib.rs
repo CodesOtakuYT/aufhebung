@@ -15,14 +15,15 @@
 //!
 //! All methods are zero-copy: `take*` returns sub-slices that borrow from the
 //! original input and advances an in-place `&mut &[T]` cursor. Byte-oriented
-//! scanning ([`ByteSliceCursor`]) is accelerated with
-//! [`memchr`](https://docs.rs/memchr)'s SIMD routines.
+//! scanning ([`ByteSliceCursor`]) delegates to
+//! [`memchr`](https://docs.rs/memchr)'s optimized routines.
 //!
 //! The cursor methods also compose into zero-copy segmenting iterators:
 //! [`SliceCursor::split_on`] for generic predicates, plus the byte-specialized
 //! [`ByteSliceCursor::split_whitespace`],
 //! [`ByteSliceCursor::split_bytes`] (a memmem pattern) and
-//! [`ByteSliceCursor::split_any`] (a set of bytes), all SIMD-accelerated.
+//! [`ByteSliceCursor::split_any`] (a set of bytes), all optimized with
+//! `memchr`/`memmem`.
 //!
 //! [`ChunkedCursor`] extends the cursor pattern to a *stream* of slices
 //! (`&[&[T]]`), where scanning bridges chunk boundaries automatically. A span
@@ -177,12 +178,12 @@ pub trait SliceCursor<'a, T> {
     fn remaining(&self) -> usize;
 
     /// Return an iterator over the sub-slices between elements matching
-    /// `split`, mirroring the inherent `<[T]>::split` but as a non-consuming
+    /// `split`, mirroring `<[T]>::split_terminator` but as a non-consuming
     /// snapshot of the cursor.
     ///
     /// Each separator element is consumed by the iterator; consecutive
-    /// separators yield empty segments, and a trailing separator yields no
-    /// trailing empty segment.
+    /// separators yield empty segments, a trailing separator yields no
+    /// trailing empty segment, and an empty input yields no segments.
     fn split_on<F>(&self, split: F) -> SplitOn<'a, T, F>
     where
         F: FnMut(&T) -> bool;
@@ -372,9 +373,9 @@ impl<'a, T> SliceCursor<'a, T> for &'a [T] {
 
 /// Precomputed search state for a set of single bytes ("any of these").
 ///
-/// Sets of one to three bytes are searched with memchr's SIMD two- and
-/// three-needle routines; larger sets fall back to a 256-bit bitmap. An empty
-/// set matches nothing.
+/// Sets of one to three bytes are searched with memchr's optimized one-,
+/// two-, and three-needle routines; larger sets fall back to a 256-bit
+/// bitmap. An empty set matches nothing.
 #[derive(Clone, Copy)]
 enum SetSearcher {
     One(u8),
@@ -431,7 +432,7 @@ fn bit(bits: &[u64; 4], b: u8) -> bool {
 /// [`SliceCursor`] specializations for `&'a [u8]`.
 ///
 /// Byte-haystack searches (single bytes, sub-slices, or sets of bytes) use
-/// [`memchr`](https://docs.rs/memchr)'s SIMD-accelerated routines.
+/// [`memchr`](https://docs.rs/memchr)'s optimized routines.
 pub trait ByteSliceCursor<'a>: SliceCursor<'a, u8> {
     /// Split off everything before the first occurrence of `byte`, leaving the
     /// cursor at `byte`. If `byte` is absent, consumes everything.
@@ -451,7 +452,7 @@ pub trait ByteSliceCursor<'a>: SliceCursor<'a, u8> {
     /// The set analogue of [`take_until_byte`](Self::take_until_byte):
     /// `take_until_any(b" \t")` stops at a space or a tab. An empty set
     /// matches nothing, so the whole remaining cursor is consumed. Sets of one
-    /// to three bytes are scanned with memchr's SIMD two- and three-needle
+    /// to three bytes are searched with memchr's optimized two- and three-needle
     /// routines; larger sets scan a 256-bit bitmap.
     fn take_until_any(&mut self, set: &[u8]) -> &'a [u8];
 
@@ -513,22 +514,22 @@ pub trait ByteSliceCursor<'a>: SliceCursor<'a, u8> {
     fn split_whitespace(&self) -> SplitWhitespace<'a>;
 
     /// Return an iterator over the sub-slices between occurrences of
-    /// `pattern`, mirroring the semantics of [`str::split`].
+    /// `pattern`, mirroring [`str::split_terminator`]: like [`str::split`],
+    /// but a trailing occurrence yields no trailing empty segment.
     ///
-    /// Searching is accelerated with a precomputed **memmem** `Finder`
-    /// (SIMD-optimized by memchr). Consecutive occurrences yield empty
-    /// segments; a trailing occurrence yields no trailing empty segment.
-    /// Panics if `pattern` is empty.
+    /// Searching reuses a precomputed **memmem** `Finder`. Consecutive
+    /// occurrences yield empty segments, and an empty input yields no
+    /// segments. Panics if `pattern` is empty.
     fn split_bytes<'p>(&self, pattern: &'p [u8]) -> SplitBytes<'a, 'p>;
 
     /// Return an iterator over the sub-slices between occurrences of *any* byte
-    /// in `set`, mirroring the semantics of [`str::split`].
+    /// in `set`, mirroring [`str::split_terminator`]: like [`str::split`], but
+    /// a trailing occurrence yields no trailing empty segment.
     ///
     /// The set analogue of [`split_bytes`](Self::split_bytes): separators are
     /// single bytes, not a multi-byte pattern. Consecutive occurrences yield
-    /// empty segments; a trailing occurrence yields no trailing empty segment.
-    /// Segments keep every byte that is not a separator — **including
-    /// surrounding spaces**.
+    /// empty segments, and an empty input yields no segments. Segments keep
+    /// every byte that is not a separator — **including surrounding spaces**.
     ///
     /// For example, splitting `b"a, b, c"` on `split_any(b",")` yields
     /// `["a", " b", " c"]`: the spaces are part of the segments, not removed.
@@ -538,7 +539,7 @@ pub trait ByteSliceCursor<'a>: SliceCursor<'a, u8> {
     /// `split_any(b",").map(|s| s.trim(b" \t"))`.
     ///
     /// An empty set matches nothing, yielding the whole input as one segment.
-    /// Sets of one to three bytes are scanned with memchr's SIMD two- and
+    /// Sets of one to three bytes are searched with memchr's optimized two- and
     /// three-needle routines; larger sets scan a 256-bit bitmap.
     fn split_any(&self, set: &[u8]) -> SplitAny<'a>;
 
@@ -747,10 +748,10 @@ impl<'a> Iterator for SplitWhitespace<'a> {
 /// Iterator over the sub-slices of a slice separated by elements matching a
 /// predicate.
 ///
-/// Produced by [`SliceCursor::split_on`] and mirroring the inherent
-/// `<[T]>::split`: each separator element is consumed, consecutive separators
-/// yield empty segments, and a trailing separator yields no trailing empty
-/// segment.
+/// Produced by [`SliceCursor::split_on`] and mirroring
+/// `<[T]>::split_terminator`: each separator element is consumed, consecutive
+/// separators yield empty segments, a trailing separator yields no trailing
+/// empty segment, and an empty input yields no segments.
 pub struct SplitOn<'a, T, F> {
     input: &'a [T],
     split: F,
@@ -780,11 +781,11 @@ impl<'a, T, F: FnMut(&T) -> bool> Iterator for SplitOn<'a, T, F> {
 
 /// Iterator over the sub-slices of a byte slice separated by a byte pattern.
 ///
-/// Produced by [`ByteSliceCursor::split_bytes`] and mirroring the semantics of
-/// [`str::split`]: consecutive occurrences yield empty segments, and a
-/// trailing occurrence yields no trailing empty segment. Searching uses a
-/// precomputed **memmem** `Finder`, so repeated searches are SIMD-accelerated.
-/// The pattern must be non-empty.
+/// Produced by [`ByteSliceCursor::split_bytes`] and mirroring
+/// [`str::split_terminator`]: consecutive occurrences yield empty segments, a
+/// trailing occurrence yields no trailing empty segment, and an empty input
+/// yields no segments. Searching reuses a precomputed **memmem** `Finder`. The
+/// pattern must be non-empty.
 pub struct SplitBytes<'a, 'p> {
     input: &'a [u8],
     finder: memmem::Finder<'p>,
@@ -830,10 +831,11 @@ impl<'a, 'p> Iterator for SplitBytes<'a, 'p> {
 ///
 /// Produced by [`ByteSliceCursor::split_any`]. Each separator byte is consumed;
 /// consecutive separators yield empty segments; a trailing separator yields no
-/// trailing empty segment, mirroring [`str::split`]. Segments are raw: bytes
-/// that are not separators — spaces included — are preserved, so split
-/// then trim if surrounding whitespace should be dropped. An empty set matches
-/// nothing, yielding the whole input as one segment.
+/// trailing empty segment, mirroring [`str::split_terminator`]; an empty input
+/// yields no segments. Segments are raw: bytes that are not separators —
+/// spaces included — are preserved, so split then trim if surrounding
+/// whitespace should be dropped. An empty set matches nothing, yielding the
+/// whole input as one segment.
 pub struct SplitAny<'a> {
     input: &'a [u8],
     searcher: SetSearcher,
@@ -902,6 +904,15 @@ impl<'a> Iterator for SplitAny<'a> {
 ///     .collect();
 /// assert_eq!(words, [[&b"de"[..], &b"f"[..]]]);
 /// ```
+///
+/// ## Cursor state
+///
+/// The cursor is a `(idx, pos)` pair into the chunk list. It may point at an
+/// exhausted or empty chunk internally: empty chunks are skipped and offsets
+/// rolled over as the cursor advances, and **every consuming operation
+/// normalizes before observing input**. Snapshot operations (`peek`,
+/// `remaining`, `split_whitespace`) are defined directly on the raw state and
+/// remain correct without normalizing.
 pub struct ChunkedCursor<'a, T> {
     chunks: &'a [&'a [T]],
     /// Index of the chunk currently pointed at.
@@ -951,7 +962,10 @@ impl<'a, T> ChunkedCursor<'a, T> {
 
     /// Number of elements remaining in the stream, summed across chunks.
     ///
-    /// Runs in time linear in the number of remaining chunks.
+    /// Well-defined even when `idx`/`pos` point at an exhausted or empty
+    /// chunk: it counts straight from the current offset without normalizing.
+    /// Returns 0 once `idx` is past the last chunk. Runs in time linear in the
+    /// number of remaining chunks.
     pub fn remaining(&self) -> usize {
         let Some(first) = self.chunks.get(self.idx) else {
             return 0;
@@ -1459,8 +1473,9 @@ impl<'a> Hash for Pieces<'a, u8> {
 
 impl<'a> fmt::Display for Pieces<'a, u8> {
     /// Print the span as lossy UTF-8, pieces in order — identical output to
-    /// displaying the concatenated bytes, with no allocation on the caller's
-    /// side.
+    /// displaying the concatenated bytes. Valid UTF-8 pieces are written
+    /// without allocation; invalid UTF-8 may allocate internally to produce
+    /// replacement characters.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for piece in *self {
             f.write_str(&String::from_utf8_lossy(piece))?;

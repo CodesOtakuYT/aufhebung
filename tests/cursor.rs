@@ -424,6 +424,50 @@ fn split_on_does_not_advance_cursor() {
     assert_eq!(s, b"a,b");
 }
 
+// ---- split-family contract: split_terminator semantics ----
+
+#[test]
+fn split_on_empty_input_yields_nothing() {
+    let s: &[u8] = b"";
+    assert_eq!(s.split_on(|&b| b == b',').count(), 0);
+}
+
+#[test]
+fn split_bytes_terminator_semantics() {
+    // trailing separator: the final empty segment is omitted (split_terminator,
+    // not split)
+    let s: &[u8] = b"a,b,";
+    let parts: Vec<&[u8]> = s.split_bytes(b",").collect();
+    assert_eq!(parts, vec![&b"a"[..], &b"b"[..]]);
+
+    // leading separator still yields a leading empty segment
+    let s: &[u8] = b",a";
+    let parts: Vec<&[u8]> = s.split_bytes(b",").collect();
+    assert_eq!(parts, vec![&b""[..], &b"a"[..]]);
+
+    // interior empty segments are preserved
+    let s: &[u8] = b"a,,b";
+    let parts: Vec<&[u8]> = s.split_bytes(b",").collect();
+    assert_eq!(parts, vec![&b"a"[..], &b""[..], &b"b"[..]]);
+
+    // empty input yields no segments
+    let s: &[u8] = b"";
+    assert_eq!(s.split_bytes(b",").count(), 0);
+}
+
+#[test]
+fn split_any_terminator_semantics() {
+    // trailing separator omits the final empty segment (spaces kept in the raw
+    // segments)
+    let s: &[u8] = b"a, b,";
+    let parts: Vec<&[u8]> = s.split_any(b",").collect();
+    assert_eq!(parts, vec![&b"a"[..], &b" b"[..]]);
+
+    // empty input yields no segments
+    let s: &[u8] = b"";
+    assert_eq!(s.split_any(b",").count(), 0);
+}
+
 #[test]
 fn split_whitespace_words() {
     let s: &[u8] = b"  hello \t world!\n";
