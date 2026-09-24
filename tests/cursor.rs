@@ -470,3 +470,18 @@ fn split_bytes_empty_pattern_panics() {
     let s: &[u8] = b"abc";
     let _ = s.split_bytes(b"");
 }
+
+#[test]
+fn take_rest_consumes_everything() {
+    let mut s: &[u8] = b"hello";
+    assert_eq!(s.take_rest(), b"hello");
+    assert!(s.is_empty());
+
+    // an exhausted cursor yields an empty rest
+    assert_eq!(s.take_rest(), b"");
+
+    // empty cursor
+    let mut s: &[u8] = b"";
+    assert_eq!(s.take_rest(), b"");
+    assert!(s.is_empty());
+}

@@ -92,6 +92,10 @@ pub trait SliceCursor<'a, T> {
     where
         F: FnMut(&T) -> bool;
 
+    /// Consume and return everything remaining in the cursor, which becomes
+    /// empty. Equivalent to `take_until(|_| false)`, but explicit.
+    fn take_rest(&mut self) -> &'a [T];
+
     /// Consume and discard the first `n` elements (clamped).
     fn advance(&mut self, n: usize);
 
@@ -226,6 +230,11 @@ impl<'a, T> SliceCursor<'a, T> for &'a [T] {
     {
         let n = self.iter().position(pred).unwrap_or(self.len());
         self.take(if n < self.len() { n + 1 } else { n })
+    }
+
+    #[inline]
+    fn take_rest(&mut self) -> &'a [T] {
+        self.take(self.len())
     }
 
     #[inline]
@@ -838,6 +847,26 @@ impl<'a, T> ChunkedCursor<'a, T> {
         self.idx = end.idx;
         self.pos = end.pos;
         Pieces::new(self.chunks, start_idx, start_pos, end.idx, end.pos)
+    }
+
+    /// Consume and return everything remaining in the stream as a [`Pieces`]
+    /// span, leaving the cursor empty.
+    ///
+    /// Equivalent to [`take_until`](Self::take_until) with an always-false
+    /// predicate (`take_until(|_| false)`), but explicit. The span is empty if
+    /// nothing remains.
+    ///
+    /// ```
+    /// use aufhebung::ChunkedCursor;
+    ///
+    /// let mut c = ChunkedCursor::new(&[b"ab", b"cde"]);
+    /// c.next_byte(); // consume b'a'
+    /// let rest = c.take_rest();
+    /// assert_eq!(rest.byte_len(), 4); // b"bcde"
+    /// assert!(c.is_empty());
+    /// ```
+    pub fn take_rest(&mut self) -> Pieces<'a, T> {
+        self.take_until(|_| false)
     }
 }
 

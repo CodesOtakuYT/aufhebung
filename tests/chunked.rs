@@ -489,3 +489,21 @@ fn pieces_display() {
     // invalid bytes render lossily, like from_utf8_lossy
     assert_eq!(pieces(&[b"a\xFFb"]).to_string(), "a\u{FFFD}b");
 }
+
+#[test]
+fn take_rest_spans_remaining_chunks() {
+    // everything after a partial parse, across several chunk boundaries
+    let mut c = cursor(&[b"ab", b"cde", b"fg"]);
+    let head = c.take_until(|&b| b == b'c'); // b"ab"
+    assert_eq!(concatenate(head), b"ab");
+    let rest = c.take_rest();
+    assert_eq!(concatenate(rest), b"cdefg");
+    assert!(c.is_empty());
+
+    // an exhausted cursor yields an empty span
+    assert!(c.take_rest().next().is_none());
+
+    // already-empty stream, including empty chunks
+    assert!(cursor(&[]).take_rest().next().is_none());
+    assert!(cursor(&[b"", b""]).take_rest().next().is_none());
+}

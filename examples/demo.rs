@@ -194,7 +194,7 @@ fn main() {
         }
     }
 
-    let body = c.take_until(|_| false);
+    let body = c.take_rest();
     println!("  body: \"{body}\" ({} bytes, zero-copy)", body.byte_len());
     println!("  Content-Length parsed straight from the pieces: {declared_length:?}");
     println!(
