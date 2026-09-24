@@ -199,3 +199,181 @@ pub fn split_chunks(input: &[u8], n: usize) -> Vec<&[u8]> {
     }
     out
 }
+// ---- streaming-fragmentation fixtures (benches/fragmentation.rs) -----------
+
+/// Split `input` into slices of at most `size` bytes, preserving order.
+pub fn split_by_size(input: &[u8], size: usize) -> Vec<&[u8]> {
+    input.chunks(size).collect()
+}
+
+/// A ~7 KiB HTTP/1 request (request line + 140 headers + blank line).
+pub fn build_http_payload() -> Vec<u8> {
+    let mut v = Vec::with_capacity(8192);
+    v.extend_from_slice(b"GET /search?q=aufhebung&lang=rust&page=1 HTTP/1.1\r\n");
+    for i in 0..140 {
+        v.extend_from_slice(
+            format!("X-Header-{i:03}: value-{i} padding-0123456789abcdef\r\n").as_bytes(),
+        );
+    }
+    v.extend_from_slice(b"Host: example.com\r\nContent-Length: 0\r\n\r\n");
+    v
+}
+
+/// An ~7.6 KiB JSON document (86 objects with nested strings and arrays).
+pub fn build_json_payload() -> Vec<u8> {
+    let mut v = Vec::with_capacity(8192);
+    v.extend_from_slice(b"{\n");
+    for i in 0..86 {
+        v.extend_from_slice(
+            format!(
+                "  \"field_{i:03}\": {{\"id\": {i}, \"name\": \"item-{i}-abcdefgh\", \
+                 \"tags\": [\"alpha\", \"beta\", \"gamma\"]}},\n"
+            )
+            .as_bytes(),
+        );
+    }
+    v.extend_from_slice(b"  \"last\": true\n}\n");
+    v
+}
+
+/// An ~8 KiB XML document (88 elements, each with an attribute-bearing child).
+pub fn build_xml_payload() -> Vec<u8> {
+    let mut v = Vec::with_capacity(8192);
+    v.extend_from_slice(b"<?xml version=\"1.0\"?>\n<root>\n");
+    for i in 0..88 {
+        v.extend_from_slice(
+            format!(
+                "  <item id=\"{i}\" name=\"item-{i}\">\n    <child key=\"value-{i}\" \
+                 note=\"0123456789abcdef\"/>\n  </item>\n"
+            )
+            .as_bytes(),
+        );
+    }
+    v.extend_from_slice(b"</root>\n");
+    v
+}
+
+/// A synthetic ~7.7 KiB stream of DNS-like messages, each a 12-byte header, a
+/// zero-terminated name (length-prefixed labels), and 4 fixed tail bytes.
+/// Synthetic because real DNS messages are far smaller; this paces the parsers
+/// with a realistic binary layout.
+pub fn build_dns_payload() -> Vec<u8> {
+    let mut v = Vec::with_capacity(8192);
+    for _ in 0..240 {
+        v.extend_from_slice(&[0u8; 12]); // message header
+        for label in [&b"www"[..], &b"example"[..], &b"com"[..]] {
+            v.push(label.len() as u8);
+            v.extend_from_slice(label);
+        }
+        v.push(0); // label terminator
+        v.extend_from_slice(&[0u8; 4]); // type + class
+    }
+    v
+}
+
+/// Count-returning wrapper so the HTTP parser fits the shared scan signature.
+pub fn scan_http(input: &[&[u8]]) -> usize {
+    parse_request_chunked(input)
+        .map(|(m, t, v, h)| m + t + v + h.len())
+        .unwrap_or(0)
+}
+
+/// Minimal JSON lexer: counts structural tokens, strings, and scalars.
+pub fn scan_json_tokens(input: &[&[u8]]) -> usize {
+    let mut c = ChunkedCursor::new(input);
+    let mut tokens = 0;
+    loop {
+        c.skip_while_any(b" \t\r\n");
+        match c.peek_byte() {
+            None => break,
+            Some(b'{') | Some(b'}') | Some(b'[') | Some(b']') | Some(b',') | Some(b':') => {
+                c.next_byte();
+                tokens += 1;
+            }
+            Some(b'"') => {
+                c.next_byte(); // opening quote
+                c.skip_until_byte(b'"'); // contents (payloads carry no escapes)
+                c.next_byte(); // closing quote
+                tokens += 1;
+            }
+            Some(_) => {
+                let scalar = c.take_until_any(b" \t\r\n,]}");
+                if scalar.byte_len() == 0 {
+                    break; // nothing to lex; stop
+                }
+                tokens += 1;
+            }
+        }
+    }
+    tokens
+}
+
+/// Minimal XML lexer: counts text runs and element/tag names.
+pub fn scan_xml_tokens(input: &[&[u8]]) -> usize {
+    let mut c = ChunkedCursor::new(input);
+    let mut tokens = 0;
+    loop {
+        // text run up to '<'
+        let text = c.take_until_byte(b'<');
+        if text.byte_len() > 0 {
+            tokens += 1;
+        }
+        match c.peek_byte() {
+            None => break,
+            Some(b'<') => {
+                c.next_byte();
+                // closing tags ("</item>") and processing instructions ("<?xml")
+                if matches!(c.peek_byte(), Some(b'/') | Some(b'?')) {
+                    c.next_byte();
+                }
+                let name = c.take_until_any(b"> \t\r\n");
+                if name.byte_len() == 0 {
+                    break; // e.g. "<" at end of stream
+                }
+                tokens += 1;
+                // skip attributes up to '>'
+                c.skip_until_byte(b'>');
+                match c.peek_byte() {
+                    Some(b'>') => {
+                        c.next_byte();
+                    }
+                    _ => break,
+                }
+            }
+            Some(_) => break,
+        }
+    }
+    tokens
+}
+
+/// Skip `n` bytes, bridging chunks; `false` if the stream runs out first.
+fn skip_bytes(c: &mut ChunkedCursor<'_, u8>, n: usize) -> bool {
+    for _ in 0..n {
+        if c.next_byte().is_none() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Walk a synthetic DNS record stream: 12-byte header, zero-terminated name,
+/// 4 fixed tail bytes per record. Returns the number of complete records.
+pub fn scan_dns_records(input: &[&[u8]]) -> usize {
+    let mut c = ChunkedCursor::new(input);
+    let mut records = 0;
+    loop {
+        if !skip_bytes(&mut c, 12) {
+            break; // header
+        }
+        let name = c.take_until_byte(0);
+        if name.byte_len() == 0 {
+            break; // no name bytes
+        }
+        c.next_byte(); // the zero terminator
+        if !skip_bytes(&mut c, 4) {
+            break; // type + class
+        }
+        records += 1;
+    }
+    records
+}

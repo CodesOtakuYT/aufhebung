@@ -1,6 +1,9 @@
 //! Integer parsing from byte spans: aufhebung's `Pieces::parse_integer` vs
 //! `btoi`, `atoi`, and `std`'s `str::parse`.
 
+mod support;
+use support::split_chunks;
+
 use aufhebung::ChunkedCursor;
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 
@@ -68,6 +71,34 @@ fn bench_int(c: &mut Criterion) {
             });
         },
     );
+    group.finish();
+
+    // The fragmentation sweep: i64::MAX split into N equal chunks.
+    // parse_integer reads across the pieces zero-copy; the alternative folds
+    // the fragments into one buffer first. Only the straddling bytes cost
+    // parse_integer anything, so the gap to flatten+btoi should narrow as N
+    // grows (and btoi's own cost is bounded below by the copy).
+    let mut group = c.benchmark_group("int/fragmentation");
+    let max: &[u8] = b"9223372036854775807";
+    for n in [1usize, 2, 3, 5, 10, 18] {
+        let pieces = split_chunks(max, n);
+        // fragmentation-invariant: the parsed value must not change
+        let mut sanity = ChunkedCursor::new(&pieces);
+        assert_eq!(sanity.take_rest().parse_integer(), Some(i64::MAX));
+
+        group.bench_with_input(BenchmarkId::new("parse_integer", n), &pieces, |b, input| {
+            b.iter(|| {
+                let mut c = ChunkedCursor::new(input);
+                black_box(c.take_rest().parse_integer())
+            });
+        });
+        group.bench_with_input(BenchmarkId::new("flatten_btoi", n), &pieces, |b, input| {
+            b.iter(|| {
+                let joined: Vec<u8> = input.iter().flat_map(|c| c.iter().copied()).collect();
+                black_box(btoi::btoi::<i64>(&joined).ok())
+            });
+        });
+    }
     group.finish();
 }
 

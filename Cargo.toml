@@ -6,6 +6,12 @@ description = "Zero-copy cursor operations on slices, accelerated with memchr fo
 keywords = ["slice", "cursor", "parser", "take", "scanning"]
 autobenches = false
 
+# Keep the lib's unit-test harness out of `cargo bench` so criterion CLI flags
+# (--save-baseline, --quick, ...) are not forwarded to libtest, which rejects
+# them (see bheisler/criterion.rs#193). Tests still run under `cargo test`.
+[lib]
+bench = false
+
 [dependencies]
 memchr = "2"
 
@@ -30,4 +36,8 @@ harness = false
 
 [[bench]]
 name = "scan"
+harness = false
+
+[[bench]]
+name = "fragmentation"
 harness = false
