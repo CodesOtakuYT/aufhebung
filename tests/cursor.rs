@@ -485,3 +485,134 @@ fn take_rest_consumes_everything() {
     assert_eq!(s.take_rest(), b"");
     assert!(s.is_empty());
 }
+
+// ---- set scanning: take_until_any / skip_while_any / split_any / trim ----
+
+#[test]
+fn take_until_any_matches_first_of_set() {
+    let mut s: &[u8] = b"GET /x HTTP/1.1";
+    assert_eq!(s.take_until_any(b" \t"), b"GET");
+    assert_eq!(s, b" /x HTTP/1.1");
+    // single-byte set behaves like take_until_byte
+    let mut s: &[u8] = b"a,b";
+    assert_eq!(s.take_until_any(b","), b"a");
+    assert_eq!(s, b",b");
+}
+
+#[test]
+fn take_until_any_absent_and_empty_set_consume_all() {
+    let mut s: &[u8] = b"abc";
+    assert_eq!(s.take_until_any(b":;"), b"abc");
+    assert!(s.is_empty());
+
+    let mut s: &[u8] = b"abc";
+    assert_eq!(s.take_until_any(b""), b"abc");
+    assert!(s.is_empty());
+}
+
+#[test]
+fn take_until_any_incl_includes_match() {
+    let mut s: &[u8] = b"a, b";
+    assert_eq!(s.take_until_any_incl(b", "), b"a,");
+    assert_eq!(s, b" b");
+
+    // no match: consumes everything, nothing extra
+    let mut s: &[u8] = b"ab";
+    assert_eq!(s.take_until_any_incl(b";"), b"ab");
+    assert!(s.is_empty());
+}
+
+#[test]
+fn take_until_any_large_set_uses_bitmap() {
+    // more than three bytes forces the bitmap scan path
+    let mut s: &[u8] = b"hello=world";
+    assert_eq!(s.take_until_any(b"=;!@#$"), b"hello");
+    assert_eq!(s, b"=world");
+}
+
+#[test]
+fn skip_while_any_skips_leading_set() {
+    let mut s: &[u8] = b"  \t foo";
+    assert_eq!(s.skip_while_any(b" \t"), 4);
+    assert_eq!(s, b"foo");
+
+    // empty set: skips nothing
+    let mut s: &[u8] = b"  x";
+    assert_eq!(s.skip_while_any(b""), 0);
+    assert_eq!(s, b"  x");
+
+    // everything in the set: skips all
+    let mut s: &[u8] = b"   ";
+    assert_eq!(s.skip_while_any(b" "), 3);
+    assert!(s.is_empty());
+}
+
+#[test]
+fn trim_strips_both_ends_non_consuming() {
+    let s: &[u8] = b"  foo \t ";
+    assert_eq!(s.trim(b" \t"), b"foo");
+    assert_eq!(s, b"  foo \t "); // cursor unchanged
+
+    let s: &[u8] = b"  foo";
+    assert_eq!(s.trim(b" \t"), b"foo");
+    let s: &[u8] = b"foo  ";
+    assert_eq!(s.trim(b" \t"), b"foo");
+    let s: &[u8] = b"foo";
+    assert_eq!(s.trim(b" \t"), b"foo");
+    let s: &[u8] = b"   ";
+    assert_eq!(s.trim(b" \t"), b"");
+    let s: &[u8] = b"";
+    assert_eq!(s.trim(b" \t"), b"");
+    let s: &[u8] = b"foo";
+    assert_eq!(s.trim(b""), b"foo"); // empty set: no-op
+    let s: &[u8] = b"a  b";
+    assert_eq!(s.trim(b" "), b"a  b"); // interior bytes are never removed
+}
+
+#[test]
+fn split_any_segments_expose_spaces() {
+    // "a, b, c": the spaces are part of the segments, not the separator
+    let s: &[u8] = b"a, b, c";
+    let parts: Vec<&[u8]> = s.split_any(b",").collect();
+    assert_eq!(parts, vec![&b"a"[..], &b" b"[..], &b" c"[..]]);
+
+    // compose with trim for clean tokens
+    let parts: Vec<&[u8]> = s.split_any(b",").map(|seg| seg.trim(b" \t")).collect();
+    assert_eq!(parts, vec![&b"a"[..], &b"b"[..], &b"c"[..]]);
+}
+
+#[test]
+fn split_any_consecutive_trailing_and_absent() {
+    // consecutive separators yield empty segments, trailing yields none
+    let s: &[u8] = b"a,,b,";
+    let parts: Vec<&[u8]> = s.split_any(b",").collect();
+    assert_eq!(parts, vec![&b"a"[..], &b""[..], &b"b"[..]]);
+
+    // no separator: one segment
+    let s: &[u8] = b"a,b";
+    let parts: Vec<&[u8]> = s.split_any(b"\t").collect();
+    assert_eq!(parts, vec![&b"a,b"[..]]);
+
+    // empty set: never matches, whole input is one segment
+    let s: &[u8] = b"abc";
+    let parts: Vec<&[u8]> = s.split_any(b"").collect();
+    assert_eq!(parts, vec![&b"abc"[..]]);
+}
+
+#[test]
+fn split_any_set_sizes() {
+    // one byte
+    let s: &[u8] = b"a-b-c";
+    let parts: Vec<&[u8]> = s.split_any(b"-").collect();
+    assert_eq!(parts, vec![&b"a"[..], &b"b"[..], &b"c"[..]]);
+
+    // two bytes (memchr2)
+    let s: &[u8] = b"a b\tc";
+    let parts: Vec<&[u8]> = s.split_any(b" \t").collect();
+    assert_eq!(parts, vec![&b"a"[..], &b"b"[..], &b"c"[..]]);
+
+    // more than three bytes (256-bit bitmap)
+    let s: &[u8] = b"a;b|c\td";
+    let parts: Vec<&[u8]> = s.split_any(b";|\t:=").collect();
+    assert_eq!(parts, vec![&b"a"[..], &b"b"[..], &b"c"[..], &b"d"[..]]);
+}

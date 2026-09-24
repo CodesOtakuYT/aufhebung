@@ -20,8 +20,9 @@
 //!
 //! The cursor methods also compose into zero-copy segmenting iterators:
 //! [`SliceCursor::split_on`] for generic predicates, plus the byte-specialized
-//! [`ByteSliceCursor::split_whitespace`] and
-//! [`ByteSliceCursor::split_bytes`] (SIMD-accelerated).
+//! [`ByteSliceCursor::split_whitespace`],
+//! [`ByteSliceCursor::split_bytes`] (a memmem pattern) and
+//! [`ByteSliceCursor::split_any`] (a set of bytes), all SIMD-accelerated.
 //!
 //! [`ChunkedCursor`] extends the cursor pattern to a *stream* of slices
 //! (`&[&[T]]`), where scanning bridges chunk boundaries automatically. A span
@@ -33,7 +34,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use memchr::{memchr, memmem, memrchr};
+use memchr::{memchr, memchr2, memchr3, memmem, memrchr};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::iter::FusedIterator;
@@ -369,9 +370,67 @@ impl<'a, T> SliceCursor<'a, T> for &'a [T] {
     }
 }
 
+/// Precomputed search state for a set of single bytes ("any of these").
+///
+/// Sets of one to three bytes are searched with memchr's SIMD two- and
+/// three-needle routines; larger sets fall back to a 256-bit bitmap. An empty
+/// set matches nothing.
+#[derive(Clone, Copy)]
+enum SetSearcher {
+    One(u8),
+    Two(u8, u8),
+    Three(u8, u8, u8),
+    Bits([u64; 4]),
+}
+
+impl SetSearcher {
+    fn new(set: &[u8]) -> Self {
+        match set.len() {
+            0 => Self::Bits([0; 4]),
+            1 => Self::One(set[0]),
+            2 => Self::Two(set[0], set[1]),
+            3 => Self::Three(set[0], set[1], set[2]),
+            _ => {
+                let mut bits = [0u64; 4];
+                for &b in set {
+                    bits[(b / 64) as usize] |= 1 << (b % 64);
+                }
+                Self::Bits(bits)
+            }
+        }
+    }
+
+    /// Position of the first byte in `hay` that is in the set.
+    #[inline]
+    fn find(&self, hay: &[u8]) -> Option<usize> {
+        match *self {
+            Self::One(b) => memchr(b, hay),
+            Self::Two(a, b) => memchr2(a, b, hay),
+            Self::Three(a, b, c) => memchr3(a, b, c, hay),
+            Self::Bits(bits) => hay.iter().position(|&b| bit(&bits, b)),
+        }
+    }
+
+    /// Whether `b` is in the set.
+    #[inline]
+    fn contains(&self, b: u8) -> bool {
+        match *self {
+            Self::One(x) => b == x,
+            Self::Two(x, y) => b == x || b == y,
+            Self::Three(x, y, z) => b == x || b == y || b == z,
+            Self::Bits(bits) => bit(&bits, b),
+        }
+    }
+}
+
+#[inline]
+fn bit(bits: &[u64; 4], b: u8) -> bool {
+    (bits[(b / 64) as usize] >> (b % 64)) & 1 != 0
+}
+
 /// [`SliceCursor`] specializations for `&'a [u8]`.
 ///
-/// Byte-haystack searches (single bytes or sub-slices) use
+/// Byte-haystack searches (single bytes, sub-slices, or sets of bytes) use
 /// [`memchr`](https://docs.rs/memchr)'s SIMD-accelerated routines.
 pub trait ByteSliceCursor<'a>: SliceCursor<'a, u8> {
     /// Split off everything before the first occurrence of `byte`, leaving the
@@ -385,6 +444,20 @@ pub trait ByteSliceCursor<'a>: SliceCursor<'a, u8> {
     /// Split off everything before the first occurrence of `pattern`, leaving
     /// the cursor at the pattern. An empty `pattern` matches immediately.
     fn take_until_bytes(&mut self, pattern: &[u8]) -> &'a [u8];
+
+    /// Split off everything before the first occurrence of *any* byte in `set`,
+    /// leaving the cursor at it. If none occurs, consumes everything.
+    ///
+    /// The set analogue of [`take_until_byte`](Self::take_until_byte):
+    /// `take_until_any(b" \t")` stops at a space or a tab. An empty set
+    /// matches nothing, so the whole remaining cursor is consumed. Sets of one
+    /// to three bytes are scanned with memchr's SIMD two- and three-needle
+    /// routines; larger sets scan a 256-bit bitmap.
+    fn take_until_any(&mut self, set: &[u8]) -> &'a [u8];
+
+    /// Like [`take_until_any`](Self::take_until_any), but the taken slice also
+    /// contains the matched byte, if any.
+    fn take_until_any_incl(&mut self, set: &[u8]) -> &'a [u8];
 
     /// Skip bytes until `byte`; the cursor ends at `byte`. Returns the number
     /// of bytes skipped.
@@ -401,6 +474,14 @@ pub trait ByteSliceCursor<'a>: SliceCursor<'a, u8> {
     /// Like [`skip_until_bytes`](Self::skip_until_bytes), but also skips past
     /// the pattern.
     fn skip_until_bytes_incl(&mut self, pattern: &[u8]) -> usize;
+
+    /// Consume and discard bytes while they are in `set`, starting at the
+    /// cursor. Returns the number of bytes skipped.
+    ///
+    /// The set analogue of [`skip_while`](SliceCursor::skip_while):
+    /// `skip_while_any(b" \t")` skips leading spaces and tabs. An empty set
+    /// skips nothing.
+    fn skip_while_any(&mut self, set: &[u8]) -> usize;
 
     /// Position of the first `byte` relative to the cursor.
     fn find_byte(&self, byte: u8) -> Option<usize>;
@@ -439,6 +520,35 @@ pub trait ByteSliceCursor<'a>: SliceCursor<'a, u8> {
     /// segments; a trailing occurrence yields no trailing empty segment.
     /// Panics if `pattern` is empty.
     fn split_bytes<'p>(&self, pattern: &'p [u8]) -> SplitBytes<'a, 'p>;
+
+    /// Return an iterator over the sub-slices between occurrences of *any* byte
+    /// in `set`, mirroring the semantics of [`str::split`].
+    ///
+    /// The set analogue of [`split_bytes`](Self::split_bytes): separators are
+    /// single bytes, not a multi-byte pattern. Consecutive occurrences yield
+    /// empty segments; a trailing occurrence yields no trailing empty segment.
+    /// Segments keep every byte that is not a separator — **including
+    /// surrounding spaces**.
+    ///
+    /// For example, splitting `b"a, b, c"` on `split_any(b",")` yields
+    /// `["a", " b", " c"]`: the spaces are part of the segments, not removed.
+    /// To get clean tokens, either include the space in the set — but then
+    /// `b"a , b"` gains empty segments, since the space itself separates — or
+    /// trim each segment:
+    /// `split_any(b",").map(|s| s.trim(b" \t"))`.
+    ///
+    /// An empty set matches nothing, yielding the whole input as one segment.
+    /// Sets of one to three bytes are scanned with memchr's SIMD two- and
+    /// three-needle routines; larger sets scan a 256-bit bitmap.
+    fn split_any(&self, set: &[u8]) -> SplitAny<'a>;
+
+    /// Return the cursor's current contents with any leading and trailing
+    /// bytes in `set` removed, as a non-consuming view: the cursor is
+    /// unchanged.
+    ///
+    /// Trimming a byte slice, e.g. optional whitespace around an HTTP header
+    /// value: `field.trim(b" \t")`. No allocation occurs.
+    fn trim(&self, set: &[u8]) -> &'a [u8];
 }
 
 impl<'a> ByteSliceCursor<'a> for &'a [u8] {
@@ -460,6 +570,20 @@ impl<'a> ByteSliceCursor<'a> for &'a [u8] {
     fn take_until_bytes(&mut self, pattern: &[u8]) -> &'a [u8] {
         let n = memmem::find(self, pattern).unwrap_or(self.len());
         self.take(n)
+    }
+
+    #[inline]
+    fn take_until_any(&mut self, set: &[u8]) -> &'a [u8] {
+        let n = SetSearcher::new(set).find(self).unwrap_or(self.len());
+        self.take(n)
+    }
+
+    #[inline]
+    fn take_until_any_incl(&mut self, set: &[u8]) -> &'a [u8] {
+        match SetSearcher::new(set).find(self) {
+            Some(pos) => self.take(pos + 1),
+            None => self.take(self.len()),
+        }
     }
 
     #[inline]
@@ -505,6 +629,17 @@ impl<'a> ByteSliceCursor<'a> for &'a [u8] {
                 n
             }
         }
+    }
+
+    #[inline]
+    fn skip_while_any(&mut self, set: &[u8]) -> usize {
+        let search = SetSearcher::new(set);
+        let n = self
+            .iter()
+            .position(|&b| !search.contains(b))
+            .unwrap_or(self.len());
+        self.advance(n);
+        n
     }
 
     #[inline]
@@ -558,6 +693,25 @@ impl<'a> ByteSliceCursor<'a> for &'a [u8] {
     #[inline]
     fn split_bytes<'p>(&self, pattern: &'p [u8]) -> SplitBytes<'a, 'p> {
         SplitBytes::new(self, pattern)
+    }
+
+    #[inline]
+    fn split_any(&self, set: &[u8]) -> SplitAny<'a> {
+        SplitAny::new(self, set)
+    }
+
+    #[inline]
+    fn trim(&self, set: &[u8]) -> &'a [u8] {
+        let search = SetSearcher::new(set);
+        let start = self
+            .iter()
+            .position(|&b| !search.contains(b))
+            .unwrap_or(self.len());
+        let end = self
+            .iter()
+            .rposition(|&b| !search.contains(b))
+            .map_or(start, |i| i + 1);
+        &self[start..end]
     }
 }
 
@@ -660,6 +814,52 @@ impl<'a, 'p> Iterator for SplitBytes<'a, 'p> {
             Some(pos) => {
                 let (segment, rest) = self.input.split_at(pos);
                 self.input = &rest[self.pattern_len..];
+                Some(segment)
+            }
+            None => {
+                let segment = self.input;
+                self.input = &[];
+                Some(segment)
+            }
+        }
+    }
+}
+
+/// Iterator over the sub-slices of a byte slice separated by *any* byte in a
+/// set.
+///
+/// Produced by [`ByteSliceCursor::split_any`]. Each separator byte is consumed;
+/// consecutive separators yield empty segments; a trailing separator yields no
+/// trailing empty segment, mirroring [`str::split`]. Segments are raw: bytes
+/// that are not separators — spaces included — are preserved, so split
+/// then trim if surrounding whitespace should be dropped. An empty set matches
+/// nothing, yielding the whole input as one segment.
+pub struct SplitAny<'a> {
+    input: &'a [u8],
+    searcher: SetSearcher,
+}
+
+impl<'a> SplitAny<'a> {
+    fn new(input: &'a [u8], set: &[u8]) -> Self {
+        Self {
+            input,
+            searcher: SetSearcher::new(set),
+        }
+    }
+}
+
+impl<'a> Iterator for SplitAny<'a> {
+    type Item = &'a [u8];
+
+    #[inline]
+    fn next(&mut self) -> Option<&'a [u8]> {
+        if self.input.is_empty() {
+            return None;
+        }
+        match self.searcher.find(self.input) {
+            Some(pos) => {
+                let (segment, rest) = self.input.split_at(pos);
+                self.input = &rest[1..];
                 Some(segment)
             }
             None => {
@@ -930,6 +1130,31 @@ impl<'a> ChunkedCursor<'a, u8> {
             }
         }
         skipped
+    }
+
+    /// Split off everything before the first occurrence of *any* byte in `set`
+    /// and return it as zero-copy [`Pieces`], advancing the cursor to the
+    /// matched byte.
+    ///
+    /// The set analogue of [`take_until_byte`](Self::take_until_byte). Stopping
+    /// bytes are single bytes, so a delimiter is found even exactly at a chunk
+    /// boundary. Like [`take_until`](Self::take_until), the starting position
+    /// is normalized and no empty leading piece is produced. An empty set
+    /// matches nothing, so the pieces cover the rest of the stream.
+    pub fn take_until_any(&mut self, set: &[u8]) -> Pieces<'a, u8> {
+        let search = SetSearcher::new(set);
+        self.take_until(|b| search.contains(*b))
+    }
+
+    /// Consume and discard bytes while they are in `set`, bridging chunk
+    /// boundaries. Returns the number of bytes skipped.
+    ///
+    /// The set analogue of [`skip_while`](Self::skip_while):
+    /// `skip_while_any(b" \t")` skips leading spaces and tabs. An empty set
+    /// skips nothing.
+    pub fn skip_while_any(&mut self, set: &[u8]) -> usize {
+        let search = SetSearcher::new(set);
+        self.skip_while(|b| search.contains(*b))
     }
 
     /// Return an iterator over the ASCII-whitespace-separated words of the

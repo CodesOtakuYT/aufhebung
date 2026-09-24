@@ -507,3 +507,56 @@ fn take_rest_spans_remaining_chunks() {
     assert!(cursor(&[]).take_rest().next().is_none());
     assert!(cursor(&[b"", b""]).take_rest().next().is_none());
 }
+
+#[test]
+fn take_until_any_stops_at_set_byte() {
+    // delimiter inside a chunk, after a boundary-crossing span
+    let mut c = cursor(&[b"he", b"llo wo", b"rld"]);
+    let pieces = c.take_until_any(b" \t");
+    assert_eq!(concatenate(pieces), b"hello");
+    assert_eq!(c.peek_byte(), Some(b' '));
+}
+
+#[test]
+fn take_until_any_across_boundary_absent_and_empty_set() {
+    // delimiter begins the next chunk exactly
+    let mut c = cursor(&[b"ab", b",cd"]);
+    let pieces = c.take_until_any(b",;");
+    assert_eq!(concatenate(pieces), b"ab");
+    assert_eq!(c.peek_byte(), Some(b','));
+
+    // absent: consumes the whole stream
+    let mut c = cursor(&[b"ab", b"cd"]);
+    let pieces = c.take_until_any(b",;");
+    assert_eq!(concatenate(pieces), b"abcd");
+    assert!(c.is_empty());
+
+    // empty set: never matches, consumes everything
+    let mut c = cursor(&[b"ab", b"cd"]);
+    let pieces = c.take_until_any(b"");
+    assert_eq!(concatenate(pieces), b"abcd");
+    assert!(c.is_empty());
+}
+
+#[test]
+fn skip_while_any_skips_across_boundary() {
+    // skips two bytes in the first chunk, one in the second
+    let mut c = cursor(&[b" \t", b" x"]);
+    assert_eq!(c.skip_while_any(b" \t"), 3);
+    assert_eq!(c.peek_byte(), Some(b'x'));
+
+    // a whole chunk of set bytes continues into the next
+    let mut c = cursor(&[b" \t", b"   y"]);
+    assert_eq!(c.skip_while_any(b" \t"), 5);
+    assert_eq!(c.peek_byte(), Some(b'y'));
+
+    // empty set skips nothing
+    let mut c = cursor(&[b" x"]);
+    assert_eq!(c.skip_while_any(b""), 0);
+    assert_eq!(c.peek_byte(), Some(b' '));
+
+    // everything in the set: skips to the end
+    let mut c = cursor(&[b" \t"]);
+    assert_eq!(c.skip_while_any(b" \t"), 2);
+    assert!(c.is_empty());
+}

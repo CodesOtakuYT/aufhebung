@@ -9,6 +9,9 @@
 //!    `Pieces` value ops (`==`, `starts_with`, `Hash`, `parse_integer`,
 //!    `byte_len`, `Display`) are used directly on the pieces: fields are
 //!    validated and printed with no concatenation at all.
+//! 4. Set-scanning: `take_until_any`, `skip_while_any`, `trim` and
+//!    `split_any` replace `|&b| b == ... || b == ...` predicates with plain
+//!    byte sets — and show what happens to the spaces in "a, b, c".
 //!
 //! Run with: `cargo run --example demo`
 
@@ -28,14 +31,6 @@ fn read_line<'a>(rest: &mut &'a [u8]) -> Option<&'a [u8]> {
     let line = rest.take_until_byte_incl(b'\n');
     let line = line.strip_suffix(b"\r\n").unwrap_or(line);
     Some(line.strip_suffix(b"\n").unwrap_or(line))
-}
-
-/// Trim optional whitespace (SP, HTAB) from both ends.
-fn trim_ows(s: &[u8]) -> &[u8] {
-    let is_ows = |b: &u8| *b == b' ' || *b == b'\t';
-    let start = s.iter().position(|b| !is_ows(b)).unwrap_or(s.len());
-    let end = s.iter().rposition(|b| !is_ows(b)).map_or(start, |i| i + 1);
-    &s[start..end]
 }
 
 /// A zero-copy HTTP/1 request: every field borrows from the input buffer.
@@ -68,7 +63,8 @@ fn parse_request<'a>(input: &'a [u8]) -> Option<Request<'a>> {
         let mut field: &[u8] = line;
         let name = field.take_until_byte(b':');
         field.skip_byte(b':');
-        let value = trim_ows(field);
+        // trim OWS (SP, HTAB) off both ends of the value
+        let value = field.trim(b" \t");
         headers.push((name, value));
     }
 
@@ -149,12 +145,14 @@ fn main() {
     ];
     let mut c = ChunkedCursor::new(chunks);
 
-    // Request line: METHOD SP target SP HTTP-version CRLF.
-    let method = c.take_until(|&b| b == b' ' || b == b'\r' || b == b'\n');
+    // Request line: METHOD SP target SP HTTP-version CRLF. Each field stops at
+    // the first byte of a set: spaces and line ends for method/target, line
+    // ends alone for version.
+    let method = c.take_until_any(b" \r\n");
     c.next_byte(); // SP
-    let target = c.take_until(|&b| b == b' ' || b == b'\r' || b == b'\n');
+    let target = c.take_until_any(b" \r\n");
     c.next_byte(); // SP
-    let version = c.take_until(|&b| b == b'\r' || b == b'\n');
+    let version = c.take_until_any(b"\r\n");
     c.next_byte(); // CR
     c.next_byte(); // LF
 
@@ -180,10 +178,10 @@ fn main() {
                 break;
             }
             Some(_) => {
-                let name = c.take_until(|&b| b == b':');
+                let name = c.take_until_byte(b':');
                 c.next_byte(); // ':'
-                c.skip_while(|&b| b == b' ' || b == b'\t'); // leading OWS
-                let value = c.take_until(|&b| b == b'\r' || b == b'\n');
+                c.skip_while_any(b" \t"); // leading OWS
+                let value = c.take_until_any(b"\r\n");
                 c.next_byte(); // CR
                 c.next_byte(); // LF
                 if name == b"Content-Length" {
@@ -200,5 +198,20 @@ fn main() {
     println!(
         "  Content-Length matches actual body length: {}",
         declared_length == Some(body.byte_len() as i64)
+    );
+
+    println!();
+    println!("=== set-scanning: what happens to the spaces in \"a, b, c\"? ===");
+
+    let list: &[u8] = b"a, b, c";
+    println!(
+        "  split_any(b\",\") segments: {:?}",
+        list.split_any(b",").map(as_str).collect::<Vec<_>>()
+    );
+    println!(
+        "  then trim(b\" \\t\") each:      {:?}",
+        list.split_any(b",")
+            .map(|s| as_str(s.trim(b" \t")))
+            .collect::<Vec<_>>()
     );
 }
