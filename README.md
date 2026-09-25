@@ -31,6 +31,22 @@ returned as a [`Pieces`] iterator — one zero-copy sub-slice per chunk touched
 See `examples/demo.rs` (`cargo run --example demo`) for a full HTTP/1 parser
 built on both the flat and chunked cursors.
 
+## Workspace layout
+
+This repository is a Cargo workspace. The `aufhebung` crate at the root is an
+umbrella (facade): it re-exports the engine crate and owns the tests,
+examples, and benchmarks, so `cargo test`, `cargo bench`, and
+`cargo run --example demo` work exactly as for a single crate.
+
+- `crates/aufhebung-core` — the implementation: slice and chunked cursors,
+  `Pieces`, split iterators, `memchr` acceleration. Depend on this directly
+  for the narrow primitive API.
+- `aufhebung` (root) — `pub use aufhebung_core::*`, so one dependency gives
+  the full API. Future add-on crates (`aufhebung-http`, `aufhebung-json`, …)
+  land in `crates/` and are re-exported here.
+- `benches/`, `tests/`, `examples/` — owned by the root crate; they exercise
+  the umbrella's public surface.
+
 ## Benchmarks
 
 Run with `cargo bench` ([`criterion`](https://docs.rs/criterion) 0.5.1, 100

@@ -1,0 +1,9 @@
+[package]
+name = "aufhebung-core"
+version.workspace = true
+edition.workspace = true
+description = "Core primitives: zero-copy slice and chunked cursors, accelerated with memchr for bytes"
+keywords = ["slice", "cursor", "parser", "take", "scanning"]
+
+[dependencies]
+memchr.workspace = true

@@ -1,7 +1,7 @@
 [package]
 name = "aufhebung"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Zero-copy cursor operations on slices, accelerated with memchr for bytes"
 keywords = ["slice", "cursor", "parser", "take", "scanning"]
 autobenches = false
@@ -13,7 +13,7 @@ autobenches = false
 bench = false
 
 [dependencies]
-memchr = "2"
+aufhebung-core = { path = "crates/aufhebung-core" }
 
 [dev-dependencies]
 atoi = "3"
@@ -21,6 +21,7 @@ bstr = "1"
 btoi = "0.5"
 criterion = "0.5"
 httparse = "1"
+memchr.workspace = true
 
 [[bench]]
 name = "http"
@@ -41,3 +42,14 @@ harness = false
 [[bench]]
 name = "fragmentation"
 harness = false
+
+[workspace]
+members = ["crates/aufhebung-core"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+memchr = "2"

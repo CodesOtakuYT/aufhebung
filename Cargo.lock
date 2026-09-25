@@ -37,10 +37,18 @@ name = "aufhebung"
 version = "0.1.0"
 dependencies = [
  "atoi",
+ "aufhebung-core",
  "bstr",
  "btoi",
  "criterion",
  "httparse",
+ "memchr",
+]
+
+[[package]]
+name = "aufhebung-core"
+version = "0.1.0"
+dependencies = [
  "memchr",
 ]
 
