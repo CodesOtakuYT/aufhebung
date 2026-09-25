@@ -62,6 +62,8 @@ values directly from borrowed chunks. The flat API is generic over element type:
 - [`ByteSliceCursor`] — the byte-specialized fast paths: `take_until_byte`,
   `skip_byte`, set operations (`take_until_any`, `skip_while_any`, `trim`),
   and the splitting iterators (`split_whitespace`, `split_bytes`, `split_any`).
+  [`ChunkedCursor`] also provides cross-chunk `take_until_bytes` for
+  multi-byte delimiters.
 
 Reading a parser written this way is linear: the cursor is the state, and each
 line consumes the next chunk of input. There are no zero-cost abstractions to
@@ -127,6 +129,36 @@ both ways — flat cursor over one buffer, and `ChunkedCursor` over the same
 request delivered in three chunks, with fields validated and printed directly
 as `Pieces`.
 
+## XML pull parsing
+
+The [`aufhebung-xml`](crates/aufhebung-xml) add-on parses XML directly from a
+chunk list and emits borrowed events instead of building a DOM:
+
+```rust
+use aufhebung_xml::{Event, Parser};
+
+let chunks: &[&[u8]] = &[
+    b"<?xml version='1.0'?>",
+    b"<atlas><SubTexture name='hero&amp;rock' x='0'/></atlas>",
+];
+let mut parser = Parser::new(chunks);
+while let Some(event) = parser.next_event().expect("valid XML") {
+    if let Event::EmptyElement { name, attributes } = event {
+        assert!(name == b"SubTexture");
+        assert!(attributes[0].value() == b"hero&amp;rock");
+    }
+}
+```
+
+`Event` covers declarations, processing instructions, comments, doctypes,
+nested elements, text, CDATA, and self-closing elements. Names, text, CDATA,
+and attribute values remain raw `Pieces`, including when they cross arbitrary
+chunk boundaries. The parser checks tag matching, one root, basic name and
+attribute syntax, and duplicate attributes. It deliberately leaves namespace
+prefixes and DTD contents literal and does not expand entity references. The
+umbrella crate re-exports the parser as `Parser`/`Event` and exposes its error
+as `XmlError`, since the HTTP add-on already owns the root-level `Error` name.
+
 ## Where this fits
 
 Concrete situations the crate is aimed at:
@@ -135,7 +167,8 @@ Concrete situations the crate is aimed at:
   headers arrive across reads; parse each received window as a chunk list
   instead of waiting for a full buffer (see the HTTP benches).
 - **Streaming JSON / XML lexers** — tokenize pushes as they land, no matter
-  where the token boundaries fall relative to the read boundaries.
+  where the token boundaries fall relative to the read boundaries; the XML
+  pull parser is available in `aufhebung-xml`.
 - **Fixed-layout binary streams** (DNS-style messages, framed protocols) —
   walk length-prefixed fields across packet boundaries.
 - **Integer extraction** — take fixed-width big- or little-endian integers
@@ -149,10 +182,11 @@ Concrete situations the crate is aimed at:
 Honest boundaries, so the fit is clear:
 
 - **Not a full protocol library** (yet). It provides cursor primitives to build
-  parsers on; the demo's HTTP/1 parser is the template, and the first add-on
-  [`aufhebung-http`](crates/aufhebung-http) ships the real thing for the
-  request line + header block. JSON/XML parsers (`aufhebung-json`, …) are the
-  intended follow-ups.
+  parsers on; the demo's HTTP/1 parser is the template, and the add-ons
+  [`aufhebung-http`](crates/aufhebung-http) and
+  [`aufhebung-xml`](crates/aufhebung-xml) ship focused parsers for HTTP/1
+  request headers and XML event streams. JSON and other schema-specific
+  parsers are possible follow-ups.
 - **Byte-oriented, not Unicode-aware.** `split_whitespace`/`Words` split on
   ASCII whitespace; there is no Unicode segmentation and no regex engine.
 - **Integers, not general scalar values.** `ChunkedCursor` takes fixed-width
@@ -211,11 +245,13 @@ examples, and benchmarks, so `cargo test`, `cargo bench`, and
   the span value operations (trimming, integer parsing, case-insensitive
   comparison) the parsers build on. Depend on this directly for the narrow
   primitive API.
-- `crates/aufhebung-http` — the first add-on: a simple zero-copy HTTP/1.1
-  *request* parser (request line + header block) over the chunked cursor.
-  Future add-ons (`aufhebung-json`, …) follow the same pattern.
-- `aufhebung` (root) — the umbrella: `pub use aufhebung_core::*` and
-  `pub use aufhebung_http::*`, so one dependency gives the whole API.
+- `crates/aufhebung-http` — a focused zero-copy HTTP/1.1 *request* parser
+  (request line + header block) over the chunked cursor.
+- `crates/aufhebung-xml` — a generic zero-copy XML pull parser for chunked
+  input, with raw borrowed event values and lightweight structural checks.
+- `aufhebung` (root) — the umbrella: it re-exports the core and add-on APIs,
+  so one dependency gives the whole surface (the XML error is `XmlError` at
+  the root to avoid the HTTP `Error` name collision).
 - `benches/`, `tests/`, `examples/` — owned by the root crate; they exercise
   the umbrella's public surface.
 

@@ -20,7 +20,8 @@
 //! The crate intentionally contains no implementation of its own; see the
 //! [`aufhebung_core`] documentation for the full API. Add-on crates are
 //! re-exported here the same way — currently the HTTP/1.1 request parser
-//! [`aufhebung_http`] — so `aufhebung` stays the one name to depend on.
+//! [`aufhebung_http`] and XML pull parser [`aufhebung_xml`] — so
+//! `aufhebung` stays the one name to depend on.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -38,3 +39,14 @@ pub use aufhebung_http;
 
 /// Re-export of the complete HTTP API at the crate root.
 pub use aufhebung_http::*;
+
+/// The XML pull-parser add-on crate, also available by name at the umbrella
+/// crate's root.
+pub use aufhebung_xml;
+
+/// The XML parser error, exposed under a distinct name because the umbrella
+/// already re-exports the HTTP error as `Error`.
+pub use aufhebung_xml::Error as XmlError;
+
+/// Re-export of the XML parser API at the crate root.
+pub use aufhebung_xml::{Attribute, Event, Parser};

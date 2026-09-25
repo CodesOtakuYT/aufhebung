@@ -15,6 +15,7 @@ bench = false
 [dependencies]
 aufhebung-core.workspace = true
 aufhebung-http.workspace = true
+aufhebung-xml.workspace = true
 
 [dev-dependencies]
 atoi = "3"
@@ -45,7 +46,11 @@ name = "fragmentation"
 harness = false
 
 [workspace]
-members = ["crates/aufhebung-core", "crates/aufhebung-http"]
+members = [
+    "crates/aufhebung-core",
+    "crates/aufhebung-http",
+    "crates/aufhebung-xml",
+]
 resolver = "3"
 
 [workspace.package]
@@ -55,4 +60,5 @@ edition = "2024"
 [workspace.dependencies]
 aufhebung-core = { path = "crates/aufhebung-core", version = "0.1.0" }
 aufhebung-http = { path = "crates/aufhebung-http", version = "0.1.0" }
+aufhebung-xml = { path = "crates/aufhebung-xml", version = "0.1.0" }
 memchr = "2"

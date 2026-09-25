@@ -31,6 +31,8 @@
 //! span-taking methods return a [`Pieces`] iterator — one zero-copy sub-slice
 //! per chunk touched — and [`ChunkedCursor::split_whitespace`] splits a chunked
 //! byte stream into [`Words`], each composed of its [`Pieces`].
+//! [`ChunkedCursor::take_until_bytes`] performs the corresponding multi-byte
+//! delimiter search without flattening the stream.
 //!
 //! Fixed-width binary integers can be consumed directly with methods such as
 //! [`ChunkedCursor::take_u32_be`] and [`ChunkedCursor::take_u64_le`]. These
@@ -1352,6 +1354,73 @@ impl<'a> ChunkedCursor<'a, u8> {
         end.skip_until_byte(byte);
         self.idx = end.idx;
         self.pos = end.pos;
+        Pieces::new(self.chunks, start_idx, start_pos, end.idx, end.pos)
+    }
+
+    /// Split off everything before the first occurrence of `pattern`, leaving
+    /// the cursor at the beginning of the pattern. The search crosses chunk
+    /// boundaries. If `pattern` is absent, the returned span covers the rest
+    /// of the stream and the cursor ends at end-of-stream.
+    ///
+    /// `pattern` must not be empty. Unlike a single-byte search, this method
+    /// leaves the cursor before the entire delimiter, not before its final
+    /// byte, so a caller can consume the delimiter after inspecting the
+    /// returned span.
+    ///
+    /// ```
+    /// use aufhebung_core::ChunkedCursor;
+    ///
+    /// let mut cursor = ChunkedCursor::new(&[b"ab", b"cd", b"tail"]);
+    /// let prefix = cursor.take_until_bytes(b"cd");
+    /// assert!(prefix == b"ab");
+    /// assert!(cursor.take_rest() == b"cdtail");
+    /// ```
+    pub fn take_until_bytes(&mut self, pattern: &[u8]) -> Pieces<'a, u8> {
+        assert!(!pattern.is_empty(), "byte pattern must not be empty");
+
+        self.skip_exhausted();
+        let start_idx = self.idx;
+        let start_pos = self.pos;
+        let mut end = *self;
+
+        loop {
+            end.skip_exhausted();
+            if end.idx >= end.chunks.len() {
+                break;
+            }
+
+            let chunk = end.chunks[end.idx];
+            let Some(offset) = memchr(pattern[0], &chunk[end.pos..]) else {
+                end.pos = chunk.len();
+                continue;
+            };
+            end.pos += offset;
+
+            let delimiter_idx = end.idx;
+            let delimiter_pos = end.pos;
+            let mut probe = end;
+            if pattern
+                .iter()
+                .all(|expected| probe.next_byte() == Some(*expected))
+            {
+                self.idx = delimiter_idx;
+                self.pos = delimiter_pos;
+                return Pieces::new(
+                    self.chunks,
+                    start_idx,
+                    start_pos,
+                    delimiter_idx,
+                    delimiter_pos,
+                );
+            }
+
+            // The first byte was a false candidate. Advance past it so a
+            // possible overlapping match beginning at the next byte is not
+            // skipped.
+            end.next_byte();
+        }
+
+        *self = end;
         Pieces::new(self.chunks, start_idx, start_pos, end.idx, end.pos)
     }
 

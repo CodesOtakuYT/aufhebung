@@ -1,0 +1,15 @@
+[package]
+name = "aufhebung-xml"
+version.workspace = true
+edition.workspace = true
+description = "Zero-copy pull parsing for XML chunked cursors"
+keywords = ["xml", "parser", "zero-copy", "cursor", "streaming"]
+autobenches = false
+
+# Keep the lib's unit-test harness out of `cargo bench`, matching the other
+# workspace libraries.
+[lib]
+bench = false
+
+[dependencies]
+aufhebung-core.workspace = true
