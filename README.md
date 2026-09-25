@@ -220,3 +220,22 @@ tool for that micro-task — on these benchmarks, at least.
 of `bstr`'s `words()` at 777 µs — though that is an unfair comparison: bstr's
 `words()` does Unicode (UAX #29) word segmentation, not ASCII whitespace
 splitting, so it is recorded here only to say why it is not compared.
+
+**Chunked word splitting** (same 16 KiB text, handed over in pieces): the
+`Words` iterator over [`ChunkedCursor`] reads each word zero-copy across piece
+boundaries, vs the naive path that must first flatten the pieces into one
+buffer ("the collect is forced by non-contiguity") and then split:
+
+| fragmentation | aufhebung (Pieces) | flatten + std `split_whitespace` |
+|---------------|--------------------|----------------------------------|
+| contiguous    | 26.8 µs            | 34.4 µs                          |
+| 4 KiB         | 26.9 µs            | 34.7 µs                          |
+| 64 B          | 29.7 µs            | 35.5 µs                          |
+| 8 B           | 30.4 µs            | 35.5 µs                          |
+
+Zero-copy wins at every fragmentation level (1.2–1.3×). Neither row is
+anywhere near the 14.4 µs of the flat cursor above: `Pieces`-word iteration
+starts ~1.9× above the flat `split_whitespace` (per-piece bookkeeping, even on
+one chunk) but then degrades gently — ~13% extra at 8 B pieces (~2,000
+chunks) — while the collect path's ~flat rows show that the forced copy, not
+the split, is what it pays.

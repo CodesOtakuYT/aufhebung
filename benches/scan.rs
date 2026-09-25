@@ -2,7 +2,10 @@
 //! `memchr`/`memmem`, vs `bstr` (itself memchr-based), vs plain linear scans.
 //! These show that the cursor wrappers cost nothing over the raw searches.
 
-use aufhebung::ByteSliceCursor;
+mod support;
+use support::split_by_size;
+
+use aufhebung::{ByteSliceCursor, ChunkedCursor};
 use bstr::ByteSlice;
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use memchr::{memchr, memmem};
@@ -99,6 +102,62 @@ fn bench_words(c: &mut Criterion, text: &[u8]) {
     group.finish();
 }
 
+/// Chunked word splitting: the same 16 KiB text split into pieces, `Words`
+/// from [`ChunkedCursor::split_whitespace`] (zero-copy across chunk
+/// boundaries) vs a naive working set that flattens the pieces into one
+/// buffer and then uses `str::split_whitespace`. The collect is *forced* by
+/// the data being non-contiguous — there is no contiguous slice to split.
+fn bench_words_chunked(c: &mut Criterion, text: &[u8]) {
+    let levels: [(&str, usize); 4] = [
+        ("contiguous", text.len()),
+        ("4KiB", 4096),
+        ("64B", 64),
+        ("8B", 8),
+    ];
+
+    let mut group = c.benchmark_group("scan/words_chunked");
+    group.throughput(Throughput::Bytes(text.len() as u64));
+
+    for (level, size) in levels {
+        let chunks = split_by_size(text, size);
+
+        // the word count must not depend on fragmentation, and the two
+        // strategies must agree (the text is pure ASCII whitespace-separated,
+        // where std's Unicode split and aufhebung's ASCII split coincide)
+        let pieces_words = ChunkedCursor::new(&chunks).split_whitespace().count();
+        let collected: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+        let std_words = std::str::from_utf8(&collected)
+            .unwrap()
+            .split_whitespace()
+            .count();
+        assert_eq!(pieces_words, std_words);
+
+        // zero-copy: iterate the Words iterator directly over the piece list
+        group.bench_with_input(BenchmarkId::new("pieces", level), &chunks, |b, input| {
+            b.iter(|| black_box(ChunkedCursor::new(input).split_whitespace().count()));
+        });
+
+        // naive: flatten the pieces into one owned buffer (the forced copy),
+        // then std's str split over it
+        group.bench_with_input(
+            BenchmarkId::new("collect_std", level),
+            &chunks,
+            |b, input| {
+                b.iter(|| {
+                    let joined: Vec<u8> = input.iter().flat_map(|c| c.iter().copied()).collect();
+                    black_box(
+                        std::str::from_utf8(&joined)
+                            .unwrap()
+                            .split_whitespace()
+                            .count(),
+                    )
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 fn bench_scan(c: &mut Criterion) {
     let csv_line: &[u8] = b"alpha,beta,gamma,delta,epsilon,zeta,eta,theta,iota,kappa\n";
     let csv: Vec<u8> = csv_line.iter().copied().cycle().take(16384).collect();
@@ -115,6 +174,7 @@ fn bench_scan(c: &mut Criterion) {
     bench_split(c, &csv);
     bench_trim(c, &padded);
     bench_words(c, &text);
+    bench_words_chunked(c, &text);
 }
 
 criterion_group!(benches, bench_scan);
