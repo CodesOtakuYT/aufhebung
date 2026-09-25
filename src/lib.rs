@@ -1,7 +1,8 @@
 //! # aufhebung
 //!
-//! Zero-copy slice-cursor operations, accelerated with [`memchr`], provided as
-//! an umbrella crate over the engine crate [`aufhebung_core`].
+//! Zero-copy slice-cursor operations, accelerated with
+//! [`memchr`](https://docs.rs/memchr), provided as an umbrella crate over the
+//! engine crate [`aufhebung_core`].
 //!
 //! The entire core API is re-exported at the crate root — [`SliceCursor`],
 //! [`ByteSliceCursor`], [`ChunkedCursor`], [`Pieces`], and the split

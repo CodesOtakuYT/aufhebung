@@ -233,6 +233,159 @@ fn skip_byte_bridges_chunks_and_preserves_mismatches() {
 }
 
 #[test]
+fn binary_take_one_byte_integers() {
+    let unsigned = 0xa5u8.to_ne_bytes();
+    assert_eq!(cursor(&[&unsigned[..]]).take_u8(), Some(0xa5));
+
+    let signed = 0x80u8.to_ne_bytes();
+    assert_eq!(cursor(&[&signed[..]]).take_i8(), Some(i8::MIN));
+}
+
+#[test]
+fn binary_take_16_bit_integers() {
+    let unsigned_be = 0x1234u16.to_be_bytes();
+    assert_eq!(cursor(&[&unsigned_be[..]]).take_u16_be(), Some(0x1234));
+
+    let unsigned_le = 0x1234u16.to_le_bytes();
+    assert_eq!(cursor(&[&unsigned_le[..]]).take_u16_le(), Some(0x1234));
+
+    let signed_be = i16::MIN.to_be_bytes();
+    assert_eq!(cursor(&[&signed_be[..]]).take_i16_be(), Some(i16::MIN));
+
+    let signed_le = i16::MIN.to_le_bytes();
+    assert_eq!(cursor(&[&signed_le[..]]).take_i16_le(), Some(i16::MIN));
+}
+
+#[test]
+fn binary_take_32_bit_integers() {
+    let unsigned_be = 0x1234_5678u32.to_be_bytes();
+    assert_eq!(cursor(&[&unsigned_be[..]]).take_u32_be(), Some(0x1234_5678));
+
+    let unsigned_le = 0x1234_5678u32.to_le_bytes();
+    assert_eq!(cursor(&[&unsigned_le[..]]).take_u32_le(), Some(0x1234_5678));
+
+    let signed_be = i32::MIN.to_be_bytes();
+    assert_eq!(cursor(&[&signed_be[..]]).take_i32_be(), Some(i32::MIN));
+
+    let signed_le = i32::MIN.to_le_bytes();
+    assert_eq!(cursor(&[&signed_le[..]]).take_i32_le(), Some(i32::MIN));
+}
+
+#[test]
+fn binary_take_64_bit_integers() {
+    let unsigned_be = 0x0123_4567_89ab_cdefu64.to_be_bytes();
+    assert_eq!(
+        cursor(&[&unsigned_be[..]]).take_u64_be(),
+        Some(0x0123_4567_89ab_cdef)
+    );
+
+    let unsigned_le = 0x0123_4567_89ab_cdefu64.to_le_bytes();
+    assert_eq!(
+        cursor(&[&unsigned_le[..]]).take_u64_le(),
+        Some(0x0123_4567_89ab_cdef)
+    );
+
+    let signed_be = i64::MIN.to_be_bytes();
+    assert_eq!(cursor(&[&signed_be[..]]).take_i64_be(), Some(i64::MIN));
+
+    let signed_le = i64::MIN.to_le_bytes();
+    assert_eq!(cursor(&[&signed_le[..]]).take_i64_le(), Some(i64::MIN));
+}
+
+#[test]
+fn binary_take_128_bit_integers() {
+    let unsigned_be = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210u128.to_be_bytes();
+    assert_eq!(
+        cursor(&[&unsigned_be[..]]).take_u128_be(),
+        Some(0x0123_4567_89ab_cdef_fedc_ba98_7654_3210)
+    );
+
+    let unsigned_le = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210u128.to_le_bytes();
+    assert_eq!(
+        cursor(&[&unsigned_le[..]]).take_u128_le(),
+        Some(0x0123_4567_89ab_cdef_fedc_ba98_7654_3210)
+    );
+
+    let signed_be = i128::MIN.to_be_bytes();
+    assert_eq!(cursor(&[&signed_be[..]]).take_i128_be(), Some(i128::MIN));
+
+    let signed_le = i128::MIN.to_le_bytes();
+    assert_eq!(cursor(&[&signed_le[..]]).take_i128_le(), Some(i128::MIN));
+}
+
+#[test]
+fn binary_take_native_width_integers() {
+    let unsigned_be = (usize::MAX - 1).to_be_bytes();
+    assert_eq!(
+        cursor(&[&unsigned_be[..]]).take_usize_be(),
+        Some(usize::MAX - 1)
+    );
+
+    let unsigned_le = (usize::MAX - 1).to_le_bytes();
+    assert_eq!(
+        cursor(&[&unsigned_le[..]]).take_usize_le(),
+        Some(usize::MAX - 1)
+    );
+
+    let signed_be = isize::MIN.to_be_bytes();
+    assert_eq!(cursor(&[&signed_be[..]]).take_isize_be(), Some(isize::MIN));
+
+    let signed_le = isize::MIN.to_le_bytes();
+    assert_eq!(cursor(&[&signed_le[..]]).take_isize_le(), Some(isize::MIN));
+}
+
+#[test]
+fn binary_take_bridges_every_chunk_boundary() {
+    let bytes = *b"0123456789abcdef";
+    let expected_be = u128::from_be_bytes(bytes);
+    let expected_le = u128::from_le_bytes(bytes);
+
+    for split in 0..=bytes.len() {
+        let chunks: &[&[u8]] = &[b"", &bytes[..split], b"", &bytes[split..], b""];
+        let mut c = cursor(chunks);
+        assert_eq!(
+            c.take_u128_be(),
+            Some(expected_be),
+            "big-endian split at byte {split}"
+        );
+        assert!(c.is_empty());
+
+        let mut c = cursor(chunks);
+        assert_eq!(
+            c.take_u128_le(),
+            Some(expected_le),
+            "little-endian split at byte {split}"
+        );
+        assert!(c.is_empty());
+    }
+}
+
+#[test]
+fn binary_take_consumes_exact_width() {
+    let value = 0x1234_5678u32.to_be_bytes();
+    let chunks: &[&[u8]] = &[&value[..2], b"", &value[2..], b"tail"];
+    let mut c = cursor(chunks);
+
+    assert_eq!(c.take_u32_be(), Some(0x1234_5678));
+    assert_eq!(c.peek_byte(), Some(b't'));
+    assert!(c.take_rest() == b"tail");
+}
+
+#[test]
+fn binary_take_short_input_does_not_advance() {
+    let chunks: &[&[u8]] = &[b"\x01", b"", b"\x02\x03"];
+    let mut c = cursor(chunks);
+
+    assert_eq!(c.take_u32_be(), None);
+    assert_eq!(c.take_u32_be(), None);
+    assert_eq!(c.peek_byte(), Some(1));
+    assert_eq!(c.next_byte(), Some(1));
+    assert_eq!(c.next_byte(), Some(2));
+    assert_eq!(c.next_byte(), Some(3));
+    assert_eq!(c.next_byte(), None);
+}
+
+#[test]
 fn peek_skips_exhausted_and_empty_chunks() {
     let chunks: &[&[u8]] = &[b"", b"x", b""];
     let c = cursor(chunks);

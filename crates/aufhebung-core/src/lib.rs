@@ -13,9 +13,9 @@
 //! assert_eq!(input, b" world!");
 //! ```
 //!
-//! All methods are zero-copy: `take*` returns sub-slices that borrow from the
-//! original input and advances an in-place `&mut &[T]` cursor. Byte-oriented
-//! scanning ([`ByteSliceCursor`]) delegates to
+//! Span-taking methods are zero-copy: `take*` returns sub-slices that borrow
+//! from the original input and advances an in-place `&mut &[T]` cursor.
+//! Byte-oriented scanning ([`ByteSliceCursor`]) delegates to
 //! [`memchr`](https://docs.rs/memchr)'s optimized routines.
 //!
 //! The cursor methods also compose into zero-copy segmenting iterators:
@@ -28,9 +28,14 @@
 //! [`ChunkedCursor`] extends the cursor pattern to a *stream* of slices
 //! (`&[&[T]]`), where scanning bridges chunk boundaries automatically. A span
 //! that crosses a chunk cannot be a single contiguous `&[T]`, so cross-boundary
-//! `take*` methods return a [`Pieces`] iterator — one zero-copy sub-slice per
-//! chunk touched — and [`ChunkedCursor::split_whitespace`] splits a chunked
+//! span-taking methods return a [`Pieces`] iterator — one zero-copy sub-slice
+//! per chunk touched — and [`ChunkedCursor::split_whitespace`] splits a chunked
 //! byte stream into [`Words`], each composed of its [`Pieces`].
+//!
+//! Fixed-width binary integers can be consumed directly with methods such as
+//! [`ChunkedCursor::take_u32_be`] and [`ChunkedCursor::take_u64_le`]. These
+//! reads bridge chunks and return `None` without advancing if the complete
+//! value is not yet available.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -881,13 +886,20 @@ impl<'a> Iterator for SplitAny<'a> {
 /// and scanning operations bridge chunk boundaries automatically. Empty chunks
 /// are treated as nothing and skipped.
 ///
-/// One operation cannot be copied verbatim from [`SliceCursor`]: a `take*`
-/// method returns a single contiguous `&'a [T]`, and a span that crosses a
-/// chunk boundary has no contiguous representation. The chunked `take*`
+/// One class of operation cannot be copied verbatim from [`SliceCursor`]: a
+/// span-taking method returns a single contiguous `&'a [T]`, and a span that
+/// crosses a chunk boundary has no contiguous representation. The chunked
 /// counterparts therefore return a zero-copy [`Pieces`] iterator with one
 /// `&'a [T]` per chunk the span touches (the first piece starts at the offset
 /// where the scan began; the last ends at the boundary that ended it). This is
 /// also why `ChunkedCursor` cannot itself implement [`SliceCursor`].
+///
+/// For byte input, consuming methods such as [`take_u32_be`](Self::take_u32_be)
+/// and [`take_i64_le`](Self::take_i64_le) decode fixed-width binary integers
+/// across chunk boundaries. Methods are provided for every primitive integer
+/// type; `_be` and `_le` make wire byte order explicit, signed values use
+/// two's-complement representation, and `usize`/`isize` use native pointer
+/// width. A short read returns `None` without changing the cursor.
 ///
 /// ```
 /// use aufhebung_core::{ByteSliceCursor, ChunkedCursor};
@@ -1092,6 +1104,7 @@ impl<'a> ChunkedCursor<'a, u8> {
     }
 
     /// Consume and return the next byte, bridging chunk boundaries.
+    #[inline]
     pub fn next_byte(&mut self) -> Option<u8> {
         self.skip_exhausted();
         if self.idx >= self.chunks.len() {
@@ -1121,6 +1134,205 @@ impl<'a> ChunkedCursor<'a, u8> {
         } else {
             false
         }
+    }
+
+    /// Consume exactly `N` bytes when all of them are available.
+    ///
+    /// Reading through a cursor copy makes a short read atomic: the original
+    /// cursor is advanced only after every requested byte has been found.
+    #[inline]
+    fn take_array<const N: usize>(&mut self) -> Option<[u8; N]> {
+        let mut end = *self;
+        let mut bytes = [0; N];
+        for byte in &mut bytes {
+            *byte = end.next_byte()?;
+        }
+        *self = end;
+        Some(bytes)
+    }
+
+    /// Consume the next byte as a `u8`, bridging chunk boundaries.
+    #[inline]
+    pub fn take_u8(&mut self) -> Option<u8> {
+        self.next_byte()
+    }
+
+    /// Consume the next byte as an `i8`, bridging chunk boundaries.
+    #[inline]
+    pub fn take_i8(&mut self) -> Option<i8> {
+        self.next_byte().map(|byte| byte as i8)
+    }
+
+    /// Consume the next two bytes as a big-endian `u16`.
+    ///
+    /// Returns `None` without advancing when fewer than two bytes remain.
+    #[inline]
+    pub fn take_u16_be(&mut self) -> Option<u16> {
+        Some(u16::from_be_bytes(self.take_array()?))
+    }
+
+    /// Consume the next two bytes as a little-endian `u16`.
+    ///
+    /// Returns `None` without advancing when fewer than two bytes remain.
+    #[inline]
+    pub fn take_u16_le(&mut self) -> Option<u16> {
+        Some(u16::from_le_bytes(self.take_array()?))
+    }
+
+    /// Consume the next two bytes as a big-endian `i16`.
+    ///
+    /// Returns `None` without advancing when fewer than two bytes remain.
+    #[inline]
+    pub fn take_i16_be(&mut self) -> Option<i16> {
+        Some(i16::from_be_bytes(self.take_array()?))
+    }
+
+    /// Consume the next two bytes as a little-endian `i16`.
+    ///
+    /// Returns `None` without advancing when fewer than two bytes remain.
+    #[inline]
+    pub fn take_i16_le(&mut self) -> Option<i16> {
+        Some(i16::from_le_bytes(self.take_array()?))
+    }
+
+    /// Consume the next four bytes as a big-endian `u32`.
+    ///
+    /// Returns `None` without advancing when fewer than four bytes remain.
+    ///
+    /// ```
+    /// use aufhebung_core::ChunkedCursor;
+    ///
+    /// let mut input = ChunkedCursor::new(&[b"\x12\x34", b"\x56\x78tail"]);
+    /// assert_eq!(input.take_u32_be(), Some(0x1234_5678));
+    /// assert_eq!(input.peek_byte(), Some(b't'));
+    /// ```
+    #[inline]
+    pub fn take_u32_be(&mut self) -> Option<u32> {
+        Some(u32::from_be_bytes(self.take_array()?))
+    }
+
+    /// Consume the next four bytes as a little-endian `u32`.
+    ///
+    /// Returns `None` without advancing when fewer than four bytes remain.
+    #[inline]
+    pub fn take_u32_le(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take_array()?))
+    }
+
+    /// Consume the next four bytes as a big-endian `i32`.
+    ///
+    /// Returns `None` without advancing when fewer than four bytes remain.
+    #[inline]
+    pub fn take_i32_be(&mut self) -> Option<i32> {
+        Some(i32::from_be_bytes(self.take_array()?))
+    }
+
+    /// Consume the next four bytes as a little-endian `i32`.
+    ///
+    /// Returns `None` without advancing when fewer than four bytes remain.
+    #[inline]
+    pub fn take_i32_le(&mut self) -> Option<i32> {
+        Some(i32::from_le_bytes(self.take_array()?))
+    }
+
+    /// Consume the next eight bytes as a big-endian `u64`.
+    ///
+    /// Returns `None` without advancing when fewer than eight bytes remain.
+    #[inline]
+    pub fn take_u64_be(&mut self) -> Option<u64> {
+        Some(u64::from_be_bytes(self.take_array()?))
+    }
+
+    /// Consume the next eight bytes as a little-endian `u64`.
+    ///
+    /// Returns `None` without advancing when fewer than eight bytes remain.
+    #[inline]
+    pub fn take_u64_le(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take_array()?))
+    }
+
+    /// Consume the next eight bytes as a big-endian `i64`.
+    ///
+    /// Returns `None` without advancing when fewer than eight bytes remain.
+    #[inline]
+    pub fn take_i64_be(&mut self) -> Option<i64> {
+        Some(i64::from_be_bytes(self.take_array()?))
+    }
+
+    /// Consume the next eight bytes as a little-endian `i64`.
+    ///
+    /// Returns `None` without advancing when fewer than eight bytes remain.
+    #[inline]
+    pub fn take_i64_le(&mut self) -> Option<i64> {
+        Some(i64::from_le_bytes(self.take_array()?))
+    }
+
+    /// Consume the next sixteen bytes as a big-endian `u128`.
+    ///
+    /// Returns `None` without advancing when fewer than sixteen bytes remain.
+    #[inline]
+    pub fn take_u128_be(&mut self) -> Option<u128> {
+        Some(u128::from_be_bytes(self.take_array()?))
+    }
+
+    /// Consume the next sixteen bytes as a little-endian `u128`.
+    ///
+    /// Returns `None` without advancing when fewer than sixteen bytes remain.
+    #[inline]
+    pub fn take_u128_le(&mut self) -> Option<u128> {
+        Some(u128::from_le_bytes(self.take_array()?))
+    }
+
+    /// Consume the next sixteen bytes as a big-endian `i128`.
+    ///
+    /// Returns `None` without advancing when fewer than sixteen bytes remain.
+    #[inline]
+    pub fn take_i128_be(&mut self) -> Option<i128> {
+        Some(i128::from_be_bytes(self.take_array()?))
+    }
+
+    /// Consume the next sixteen bytes as a little-endian `i128`.
+    ///
+    /// Returns `None` without advancing when fewer than sixteen bytes remain.
+    #[inline]
+    pub fn take_i128_le(&mut self) -> Option<i128> {
+        Some(i128::from_le_bytes(self.take_array()?))
+    }
+
+    /// Consume the next native-width bytes as a big-endian `usize`.
+    ///
+    /// Returns `None` without advancing when fewer than `size_of::<usize>()`
+    /// bytes remain.
+    #[inline]
+    pub fn take_usize_be(&mut self) -> Option<usize> {
+        Some(usize::from_be_bytes(self.take_array()?))
+    }
+
+    /// Consume the next native-width bytes as a little-endian `usize`.
+    ///
+    /// Returns `None` without advancing when fewer than `size_of::<usize>()`
+    /// bytes remain.
+    #[inline]
+    pub fn take_usize_le(&mut self) -> Option<usize> {
+        Some(usize::from_le_bytes(self.take_array()?))
+    }
+
+    /// Consume the next native-width bytes as a big-endian `isize`.
+    ///
+    /// Returns `None` without advancing when fewer than `size_of::<isize>()`
+    /// bytes remain.
+    #[inline]
+    pub fn take_isize_be(&mut self) -> Option<isize> {
+        Some(isize::from_be_bytes(self.take_array()?))
+    }
+
+    /// Consume the next native-width bytes as a little-endian `isize`.
+    ///
+    /// Returns `None` without advancing when fewer than `size_of::<isize>()`
+    /// bytes remain.
+    #[inline]
+    pub fn take_isize_le(&mut self) -> Option<isize> {
+        Some(isize::from_le_bytes(self.take_array()?))
     }
 
     /// Split off everything before the first occurrence of `byte` and return

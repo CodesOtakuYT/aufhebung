@@ -3,10 +3,11 @@
 Zero-copy slice-cursor operations, accelerated with [`memchr`](https://docs.rs/memchr) for bytes — built to parse byte streams that do **not** arrive in one piece.
 
 `aufhebung` gives parsers a *cursor* over their input: `take_*`/`skip_*` methods
-that peel fields off the front of a slice while advancing an in-place cursor,
-with nothing ever copied or allocated on the scanning path. The same cursor
-pattern extends to a *stream* of slices (`&[&[T]]`), so a parser can read
-across chunk boundaries as if the data were one continuous buffer.
+that peel fields off the front of a slice while advancing an in-place cursor.
+Span operations return borrowed data without copying or allocating; fixed-width
+integer values decode directly from the chunks. The same cursor pattern extends
+to a *stream* of slices (`&[&[T]]`), so a parser can read across chunk
+boundaries as if the data were one continuous buffer.
 
 ---
 
@@ -29,11 +30,11 @@ cost something:
    Zero fragmentation, but every byte is moved at least once — a memcpy on the
    receive path and an allocator in the hot path, per message.
 
-`aufhebung` offers a third option: **parse the piece list itself, zero-copy.**
-You hand the parser `&[&[T]]` — the slices you already received — and it scans
-across the chunk boundaries for you. Fields that straddle a boundary are still
-usable values, composed of one sub-slice per chunk touched (`Pieces`). This is
-the crate's reason to exist, and the [streaming-fragmentation benchmarks](#streaming-fragmentation-the-crates-reason-to-exist) measure the trade honestly:
+`aufhebung` offers a third option: **parse the piece list itself, without joining
+it.** You hand the parser `&[&[T]]` — the slices you already received — and it
+scans across the chunk boundaries for you. Fields that straddle a boundary are
+still usable values, composed of one sub-slice per chunk touched (`Pieces`).
+This is the crate's reason to exist, and the [streaming-fragmentation benchmarks](#streaming-fragmentation-the-crates-reason-to-exist) measure the trade honestly:
 on this machine, parsing a heavily fragmented stream directly beats copying
 the stream together first, at every fragmentation level tested.
 
@@ -51,9 +52,10 @@ rest.skip_byte(b' ');                      // SP
 let target = rest.take_until_byte(b' ');   // b"/index.html"
 ```
 
-Every `take_*` returns a sub-slice that **borrows** from the input while
-advancing an in-place `&mut &[T]` cursor; every `skip_*` discards without
-copying. The flat API is generic over element type:
+Span-oriented `take_*` methods return a sub-slice that **borrows** from the
+input while advancing an in-place `&mut &[T]` cursor; every `skip_*` discards
+without copying. Fixed-width binary integer methods described below decode
+values directly from borrowed chunks. The flat API is generic over element type:
 
 - [`SliceCursor`] — `take`, `take_while`, `take_until` (and `_incl` variants),
   `take_rest`, `advance`, `skip_while`, `skip_until` for any `&[T]`.
@@ -78,8 +80,9 @@ safe-Rust view of the borrowed input.
 ## Chunked streams: parse what you actually got
 
 [`ChunkedCursor`] extends the cursor to a *stream* of slices (`&[&[T]]`),
-scanning across chunk boundaries automatically. A span that crosses a chunk is
-returned as a [`Pieces`] iterator — one zero-copy sub-slice per chunk touched:
+scanning across chunk boundaries automatically. A scanned byte span that crosses
+a chunk is returned as a [`Pieces`] iterator — one zero-copy sub-slice per chunk
+touched:
 
 ```rust
 use aufhebung::ChunkedCursor;
@@ -98,6 +101,19 @@ byte-set membership (`contains_any`), `byte_len`, integer parsing
 genuinely need a contiguous byte buffer.
 There is also a chunked `split_whitespace` → `Words` iterator for tokenizing
 a fragmented stream.
+
+Fixed-width binary integers are consumed directly across every primitive integer
+width, with explicit big- or little-endian methods wherever byte order applies.
+Reads bridge chunk boundaries, and an incomplete value returns `None` without
+consuming any partial bytes:
+
+```rust
+use aufhebung::ChunkedCursor;
+
+let mut packet = ChunkedCursor::new(&[b"\x00\x00\x12", b"\x34tail"]);
+assert_eq!(packet.take_u32_be(), Some(0x1234));
+assert_eq!(packet.peek_byte(), Some(b't'));
+```
 
 The trade is measured, not assumed: cross-chunk scanning costs more than the
 flat cursor per byte (on the bench machine, ~2.4–3.2× on a 94-byte request
@@ -122,8 +138,8 @@ Concrete situations the crate is aimed at:
   where the token boundaries fall relative to the read boundaries.
 - **Fixed-layout binary streams** (DNS-style messages, framed protocols) —
   walk length-prefixed fields across packet boundaries.
-- **Integer extraction** — parse an `i64` whose digits straddle two receives
-  without first joining them.
+- **Integer extraction** — take fixed-width big- or little-endian integers
+  across receives, or parse a decimal `i64` whose digits straddle two chunks.
 - **Zero-copy tokenizing** — `split_whitespace` / `split_bytes` / `split_any`
   over flat or chunked input, where each token is a slice (or `Pieces`) of the
   original buffer.
@@ -139,8 +155,9 @@ Honest boundaries, so the fit is clear:
   intended follow-ups.
 - **Byte-oriented, not Unicode-aware.** `split_whitespace`/`Words` split on
   ASCII whitespace; there is no Unicode segmentation and no regex engine.
-- **One scalar op.** `Pieces::parse_integer` covers `i64`; no float or string
-  value parsing is built in.
+- **Integers, not general scalar values.** `ChunkedCursor` takes fixed-width
+  binary integers and `Pieces::parse_integer` covers decimal `i64`; no float or
+  string value parsing is built in.
 - **Only worth it when contiguity is not free.** If your input is always one
   contiguous buffer, the flat cursor is all you need — and the benchmarks show
   it costs the same as raw `memchr`.
@@ -189,10 +206,11 @@ umbrella (facade): it re-exports the engine crate and owns the tests,
 examples, and benchmarks, so `cargo test`, `cargo bench`, and
 `cargo run --example demo` work exactly as for a single crate.
 
-- `crates/aufhebung-core` — the engine: slice and chunked cursors, `Pieces`,
-  split iterators, `memchr` acceleration, and the span value operations
-  (trimming, integer parsing, case-insensitive comparison) the parsers build on.
-  Depend on this directly for the narrow primitive API.
+- `crates/aufhebung-core` — the engine: slice and chunked cursors, fixed-width
+  binary integer reads, `Pieces`, split iterators, `memchr` acceleration, and
+  the span value operations (trimming, integer parsing, case-insensitive
+  comparison) the parsers build on. Depend on this directly for the narrow
+  primitive API.
 - `crates/aufhebung-http` — the first add-on: a simple zero-copy HTTP/1.1
   *request* parser (request line + header block) over the chunked cursor.
   Future add-ons (`aufhebung-json`, …) follow the same pattern.
