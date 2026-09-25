@@ -1,0 +1,15 @@
+[package]
+name = "aufhebung-http"
+version.workspace = true
+edition.workspace = true
+description = "Simple zero-copy HTTP/1.1 request parsing on aufhebung's chunked cursors"
+keywords = ["http", "parser", "zero-copy", "cursor", "streaming"]
+autobenches = false
+
+# Keep the lib's unit-test harness out of `cargo bench` (criterion CLI flags
+# get forwarded to libtest otherwise — same reason as the umbrella crate).
+[lib]
+bench = false
+
+[dependencies]
+aufhebung-core.workspace = true

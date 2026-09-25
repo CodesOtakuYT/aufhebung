@@ -131,10 +131,11 @@ Concrete situations the crate is aimed at:
 
 Honest boundaries, so the fit is clear:
 
-- **Not a protocol library** (yet). It provides cursor primitives to build
-  parsers on; the demo's HTTP/1 parser is the template. Batteries-included
-  parsers (`aufhebung-http`, `aufhebung-json`, …) are the intended extension
-  path — see the workspace layout below.
+- **Not a full protocol library** (yet). It provides cursor primitives to build
+  parsers on; the demo's HTTP/1 parser is the template, and the first add-on
+  [`aufhebung-http`](crates/aufhebung-http) ships the real thing for the
+  request line + header block. JSON/XML parsers (`aufhebung-json`, …) are the
+  intended follow-ups.
 - **Byte-oriented, not Unicode-aware.** `split_whitespace`/`Words` split on
   ASCII whitespace; there is no Unicode segmentation and no regex engine.
 - **One scalar op.** `Pieces::parse_integer` covers `i64`; no float or string
@@ -187,12 +188,15 @@ umbrella (facade): it re-exports the engine crate and owns the tests,
 examples, and benchmarks, so `cargo test`, `cargo bench`, and
 `cargo run --example demo` work exactly as for a single crate.
 
-- `crates/aufhebung-core` — the implementation: slice and chunked cursors,
-  `Pieces`, split iterators, `memchr` acceleration. Depend on this directly
-  for the narrow primitive API.
-- `aufhebung` (root) — `pub use aufhebung_core::*`, so one dependency gives
-  the full API. Future add-on crates (`aufhebung-http`, `aufhebung-json`, …)
-  land in `crates/` and are re-exported here.
+- `crates/aufhebung-core` — the engine: slice and chunked cursors, `Pieces`,
+  split iterators, `memchr` acceleration, and the span value operations
+  (trimming, integer parsing, case-insensitive comparison) the parsers build on.
+  Depend on this directly for the narrow primitive API.
+- `crates/aufhebung-http` — the first add-on: a simple zero-copy HTTP/1.1
+  *request* parser (request line + header block) over the chunked cursor.
+  Future add-ons (`aufhebung-json`, …) follow the same pattern.
+- `aufhebung` (root) — the umbrella: `pub use aufhebung_core::*` and
+  `pub use aufhebung_http::*`, so one dependency gives the whole API.
 - `benches/`, `tests/`, `examples/` — owned by the root crate; they exercise
   the umbrella's public surface.
 

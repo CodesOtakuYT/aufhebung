@@ -1380,6 +1380,128 @@ impl<'a> Pieces<'a, u8> {
         rest.is_empty()
     }
 
+    /// Strip bytes in `set` from the start of the span, zero-copy.
+    ///
+    /// The set test is applied per byte across piece boundaries. An empty
+    /// `set`, or a span whose first byte is not in it, returns the span
+    /// unchanged; a span whose every byte is in `set` trims to an empty span.
+    ///
+    /// ```
+    /// use aufhebung_core::ChunkedCursor;
+    ///
+    /// let span = ChunkedCursor::new(&[b"  he", b"llo\t "]).take_until_byte(b'\0');
+    /// assert_eq!(span.trim_start(b" \t").byte_len(), 7);
+    /// assert!(span.trim_start(b" \t") == b"hello\t ");
+    /// ```
+    pub fn trim_start(&self, set: &[u8]) -> Pieces<'a, u8> {
+        let mut i = self.idx;
+        let mut p = self.pos;
+        loop {
+            if i > self.end_idx || (i == self.end_idx && p >= self.end_pos) {
+                break; // span exhausted
+            }
+            if i == self.end_idx {
+                let slice = &self.chunks[i][p..self.end_pos];
+                p += slice.iter().take_while(|&&b| set.contains(&b)).count();
+                break;
+            }
+            let slice = &self.chunks[i][p..];
+            p += slice.iter().take_while(|&&b| set.contains(&b)).count();
+            if p < self.chunks[i].len() {
+                break;
+            }
+            // the whole chunk is in `set`; move to the next non-empty chunk
+            i += 1;
+            while i < self.end_idx && self.chunks[i].is_empty() {
+                i += 1;
+            }
+            p = 0;
+        }
+        Pieces::new(self.chunks, i, p, self.end_idx, self.end_pos)
+    }
+
+    /// Strip bytes in `set` from the end of the span, zero-copy.
+    ///
+    /// The set test is applied per byte across piece boundaries. An empty
+    /// `set`, or a span whose last byte is not in it, returns the span
+    /// unchanged; a span whose every byte is in `set` trims to an empty span.
+    /// Trimming never moves the start of the span.
+    ///
+    /// ```
+    /// use aufhebung_core::ChunkedCursor;
+    ///
+    /// let span = ChunkedCursor::new(&[b"  he", b"llo\t "]).take_until_byte(b'\0');
+    /// assert_eq!(span.trim_end(b" \t").byte_len(), 7);
+    /// assert!(span.trim_end(b" \t") == b"  hello");
+    /// ```
+    pub fn trim_end(&self, set: &[u8]) -> Pieces<'a, u8> {
+        let mut ei = self.end_idx;
+        let mut ep = self.end_pos;
+        loop {
+            if ei == self.idx && ep <= self.pos {
+                break; // at the span start; nothing left to trim
+            }
+            if ep == 0 {
+                // step back to the previous chunk that holds span bytes
+                let mut i = ei - 1;
+                while i > self.idx && self.chunks[i].is_empty() {
+                    i -= 1;
+                }
+                ei = i;
+                ep = self.chunks[ei].len();
+                continue;
+            }
+            if !set.contains(&self.chunks[ei][ep - 1]) {
+                break;
+            }
+            ep -= 1;
+        }
+        Pieces::new(self.chunks, self.idx, self.pos, ei, ep)
+    }
+
+    /// Trim bytes in `set` from both ends of the span, zero-copy.
+    ///
+    /// Equivalent to [`trim_start`](Self::trim_start) followed by
+    /// [`trim_end`](Self::trim_end).
+    ///
+    /// ```
+    /// use aufhebung_core::ChunkedCursor;
+    ///
+    /// let span = ChunkedCursor::new(&[b"  he", b"llo\t "]).take_until_byte(b'\0');
+    /// assert!(span.trim(b" \t") == b"hello");
+    /// ```
+    pub fn trim(&self, set: &[u8]) -> Pieces<'a, u8> {
+        self.trim_start(set).trim_end(set)
+    }
+
+    /// Whether the span's bytes equal `other`, ignoring ASCII case.
+    ///
+    /// Names and values may straddle piece boundaries; the comparison walks
+    /// the pieces in order and never materializes the span. Different byte
+    /// lengths never compare equal.
+    ///
+    /// ```
+    /// use aufhebung_core::ChunkedCursor;
+    ///
+    /// let name = ChunkedCursor::new(&[b"Conte", b"nt-Type;"]).take_until_byte(b';');
+    /// assert!(name.eq_ignore_ascii_case(b"content-type"));
+    /// assert!(!name.eq_ignore_ascii_case(b"content-length"));
+    /// ```
+    pub fn eq_ignore_ascii_case(&self, other: &[u8]) -> bool {
+        if self.byte_len() != other.len() {
+            return false;
+        }
+        let mut rest = other;
+        for piece in *self {
+            let n = piece.len();
+            if !piece.eq_ignore_ascii_case(&rest[..n]) {
+                return false;
+            }
+            rest = &rest[n..];
+        }
+        true
+    }
+
     /// Copy the span's bytes into `dst`, in order, without allocating.
     ///
     /// Returns `Some(())` after writing the span into the first `byte_len()`

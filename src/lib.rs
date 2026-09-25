@@ -17,9 +17,9 @@
 //! ```
 //!
 //! The crate intentionally contains no implementation of its own; see the
-//! [`aufhebung_core`] documentation for the full API. Future add-on crates
-//! (`aufhebung-http`, `aufhebung-json`, …) will be re-exported here the same
-//! way, so `aufhebung` stays the one name to depend on.
+//! [`aufhebung_core`] documentation for the full API. Add-on crates are
+//! re-exported here the same way — currently the HTTP/1.1 request parser
+//! [`aufhebung_http`] — so `aufhebung` stays the one name to depend on.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -30,3 +30,10 @@ pub use aufhebung_core;
 
 /// Re-export of the complete core API at the crate root.
 pub use aufhebung_core::*;
+
+/// The add-on HTTP/1.1 request parser crate (also flattened into this
+/// crate's root via the glob re-export below).
+pub use aufhebung_http;
+
+/// Re-export of the complete HTTP API at the crate root.
+pub use aufhebung_http::*;
