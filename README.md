@@ -1,10 +1,46 @@
 # aufhebung
 
-Zero-copy slice-cursor operations, accelerated with [`memchr`](https://docs.rs/memchr) for bytes.
+Zero-copy slice-cursor operations, accelerated with [`memchr`](https://docs.rs/memchr) for bytes — built to parse byte streams that do **not** arrive in one piece.
 
-`slice.f(...)` extension traits keep the cursor pattern — `take_*` returns
-sub-slices that borrow from the input while advancing an in-place `&mut &[T]`
-cursor, so nothing is ever copied or allocated on the scanning path.
+`aufhebung` gives parsers a *cursor* over their input: `take_*`/`skip_*` methods
+that peel fields off the front of a slice while advancing an in-place cursor,
+with nothing ever copied or allocated on the scanning path. The same cursor
+pattern extends to a *stream* of slices (`&[&[T]]`), so a parser can read
+across chunk boundaries as if the data were one continuous buffer.
+
+---
+
+## The problem this crate solves
+
+Every parser API wants the input as one contiguous `&[u8]`. Real streamed I/O
+rarely provides that: a TCP session delivers its request in several segments,
+a QUIC stream in whatever the network decided, a syslog or log-shipper pipeline
+in buffer hunks, a sound/video source in frame-sized chunks. The pieces arrive
+with **fields split across their boundaries** — half an HTTP header in one
+segment, the rest in the next.
+
+Faced with fragmented input, conventional code has two options, both of which
+cost something:
+
+1. **Wait until the whole message is buffered contiguously**, then parse.
+   This means a framing/accumulation layer of its own, latency before any field
+   is visible, and memory that grows with the largest message you might see.
+2. **Copy each piece into one buffer as it arrives**, then parse as usual.
+   Zero fragmentation, but every byte is moved at least once — a memcpy on the
+   receive path and an allocator in the hot path, per message.
+
+`aufhebung` offers a third option: **parse the piece list itself, zero-copy.**
+You hand the parser `&[&[T]]` — the slices you already received — and it scans
+across the chunk boundaries for you. Fields that straddle a boundary are still
+usable values, composed of one sub-slice per chunk touched (`Pieces`). This is
+the crate's reason to exist, and the [streaming-fragmentation benchmarks](#streaming-fragmentation-the-crates-reason-to-exist) measure the trade honestly:
+on this machine, parsing a heavily fragmented stream directly beats copying
+the stream together first, at every fragmentation level tested.
+
+## A cursor, not combinators
+
+The crate implements the "parser input cursor" pattern as plain trait methods
+— no combinator machinery, no macros, no `Result` plumbing:
 
 ```rust
 use aufhebung::ByteSliceCursor;
@@ -15,21 +51,134 @@ rest.skip_byte(b' ');                      // SP
 let target = rest.take_until_byte(b' ');   // b"/index.html"
 ```
 
-Byte-haystack searching (single bytes, `memmem` sub-slices, and sets of bytes
-via `memchr2`/`memchr3`, with a bitmap fallback for larger sets) is delegated
-to `memchr`'s optimized routines, so the flat methods cost the same as calling
-`memchr` directly.
+Every `take_*` returns a sub-slice that **borrows** from the input while
+advancing an in-place `&mut &[T]` cursor; every `skip_*` discards without
+copying. The flat API is generic over element type:
 
-## Chunked streams
+- [`SliceCursor`] — `take`, `take_while`, `take_until` (and `_incl` variants),
+  `take_rest`, `advance`, `skip_while`, `skip_until` for any `&[T]`.
+- [`ByteSliceCursor`] — the byte-specialized fast paths: `take_until_byte`,
+  `skip_byte`, set operations (`take_until_any`, `skip_while_any`, `trim`),
+  and the splitting iterators (`split_whitespace`, `split_bytes`, `split_any`).
+
+Reading a parser written this way is linear: the cursor is the state, and each
+line consumes the next chunk of input. There are no zero-cost abstractions to
+chase — a `take_until_byte` is literally a `memchr` call plus a slice split.
+
+## memchr under the hood
+
+Byte-haystack searching is delegated to [`memchr`](https://docs.rs/memchr)'s
+optimized routines — single bytes via `memchr`, sub-slice patterns via
+`memmem`, byte *sets* via `memchr2`/`memchr3` with a bitmap fallback for larger
+sets — so the flat cursor methods cost the same as calling `memchr` directly,
+and the crate is `#![forbid(unsafe_code)]` with a single dependency
+(`memchr`). Every slice and piece the cursor methods produce is a plain
+safe-Rust view of the borrowed input.
+
+## Chunked streams: parse what you actually got
 
 [`ChunkedCursor`] extends the cursor to a *stream* of slices (`&[&[T]]`),
-scanning across chunk boundaries automatically. Spans that cross a chunk are
-returned as a [`Pieces`] iterator — one zero-copy sub-slice per chunk touched
-— and fields stay usable as zero-copy values via the `Pieces` value ops
-(`==`, `starts_with`, `Hash`, `parse_integer`, `byte_len`, `Display`).
+scanning across chunk boundaries automatically. A span that crosses a chunk is
+returned as a [`Pieces`] iterator — one zero-copy sub-slice per chunk touched:
 
-See `examples/demo.rs` (`cargo run --example demo`) for a full HTTP/1 parser
-built on both the flat and chunked cursors.
+```rust
+use aufhebung::ChunkedCursor;
+
+let chunks: &[&[u8]] = &[b"hello ", b"world!"];
+let mut cursor = ChunkedCursor::new(chunks);
+let word = cursor.take_until_byte(b'!');   // spans both chunks
+assert_eq!(word.byte_len(), 11);           // one value, two pieces
+assert!(word == b"hello world");
+```
+
+Fields stay usable **as values** without ever being concatenated: `Pieces`
+implements comparison (`==`), hashing (`Hash`), `Display`, `starts_with`,
+`byte_len`, integer parsing (`parse_integer` → `Option<i64>`), and
+`copy_into` for the rare moment you genuinely need a contiguous byte buffer.
+There is also a chunked `split_whitespace` → `Words` iterator for tokenizing
+a fragmented stream.
+
+The trade is measured, not assumed: cross-chunk scanning costs more than the
+flat cursor per byte (on the bench machine, ~2.4–3.2× on a 94-byte request
+split across 3–16 chunks), but the alternative — ensuring contiguity — costs a
+full copy of the message. See the benchmarks; the crate's position is that
+*accepting* fragmentation beats *paying to remove it*, and the numbers back
+that up on this hardware.
+
+`examples/demo.rs` (`cargo run --example demo`) builds a full HTTP/1 parser
+both ways — flat cursor over one buffer, and `ChunkedCursor` over the same
+request delivered in three chunks, with fields validated and printed directly
+as `Pieces`.
+
+## Where this fits
+
+Concrete situations the crate is aimed at:
+
+- **HTTP/1-style message parsing over TCP segments** — request line and
+  headers arrive across reads; parse each received window as a chunk list
+  instead of waiting for a full buffer (see the HTTP benches).
+- **Streaming JSON / XML lexers** — tokenize pushes as they land, no matter
+  where the token boundaries fall relative to the read boundaries.
+- **Fixed-layout binary streams** (DNS-style messages, framed protocols) —
+  walk length-prefixed fields across packet boundaries.
+- **Integer extraction** — parse an `i64` whose digits straddle two receives
+  without first joining them.
+- **Zero-copy tokenizing** — `split_whitespace` / `split_bytes` / `split_any`
+  over flat or chunked input, where each token is a slice (or `Pieces`) of the
+  original buffer.
+
+## What it is not
+
+Honest boundaries, so the fit is clear:
+
+- **Not a protocol library** (yet). It provides cursor primitives to build
+  parsers on; the demo's HTTP/1 parser is the template. Batteries-included
+  parsers (`aufhebung-http`, `aufhebung-json`, …) are the intended extension
+  path — see the workspace layout below.
+- **Byte-oriented, not Unicode-aware.** `split_whitespace`/`Words` split on
+  ASCII whitespace; there is no Unicode segmentation and no regex engine.
+- **One scalar op.** `Pieces::parse_integer` covers `i64`; no float or string
+  value parsing is built in.
+- **Only worth it when contiguity is not free.** If your input is always one
+  contiguous buffer, the flat cursor is all you need — and the benchmarks show
+  it costs the same as raw `memchr`.
+- Benchmark claims are scoped: numbers are *on these benchmarks, on this
+  machine*, not blanket performance promises.
+
+## Quick start
+
+```sh
+cargo add aufhebung
+```
+
+```rust
+use aufhebung::{ByteSliceCursor, ChunkedCursor};
+
+// flat: peel fields off a contiguous buffer, borrow-only
+let mut rest: &[u8] = b"GET / HTTP/1.1\r\n";
+let method = rest.take_until_byte(b' ');   // b"GET"
+rest.skip_byte(b' ');                      // SP
+let target = rest.take_until_byte(b' ');   // b"/"
+assert_eq!(method, b"GET");
+assert_eq!(target, b"/");
+
+// chunked: the same request, delivered across pieces — fields are still
+// single zero-copy values even when they straddle a piece boundary
+let mut stream = ChunkedCursor::new(&[
+    b"GE",
+    b"T / HT",
+    b"TP/1.1\r\nHost: ex",
+    b"ample.com\r\n\r\n",
+]);
+assert!(stream.take_until_byte(b' ') == b"GET"); // spans pieces 1–2
+let _ = stream.next_byte();                      // the SP
+assert!(stream.take_until_byte(b' ') == b"/");
+let _ = stream.next_byte();                      // the SP
+let version = stream.take_until_byte(b'\r');     // b"HTTP/1.1": pieces 2–3
+assert!(version == b"HTTP/1.1");
+```
+
+Full docs: [`docs.rs/aufhebung`](https://docs.rs/aufhebung).
 
 ## Workspace layout
 
