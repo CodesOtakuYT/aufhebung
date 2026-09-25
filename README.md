@@ -93,8 +93,9 @@ assert!(word == b"hello world");
 
 Fields stay usable **as values** without ever being concatenated: `Pieces`
 implements comparison (`==`), hashing (`Hash`), `Display`, `starts_with`,
-`byte_len`, integer parsing (`parse_integer` → `Option<i64>`), and
-`copy_into` for the rare moment you genuinely need a contiguous byte buffer.
+byte-set membership (`contains_any`), `byte_len`, integer parsing
+(`parse_integer` → `Option<i64>`), and `copy_into` for the rare moment you
+genuinely need a contiguous byte buffer.
 There is also a chunked `split_whitespace` → `Words` iterator for tokenizing
 a fragmented stream.
 

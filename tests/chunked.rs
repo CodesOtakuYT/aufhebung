@@ -212,6 +212,27 @@ fn next_byte_bridges_chunk_boundaries() {
 }
 
 #[test]
+fn skip_byte_bridges_chunks_and_preserves_mismatches() {
+    let chunks: &[&[u8]] = &[b"", b"ab", b"", b"cd"];
+    let mut c = cursor(chunks);
+
+    assert!(c.skip_byte(b'a'));
+    assert_eq!(c.peek_byte(), Some(b'b'));
+
+    assert!(!c.skip_byte(b'a'));
+    assert_eq!(c.peek_byte(), Some(b'b'));
+
+    assert!(!c.skip_byte(b'z'));
+    assert_eq!(c.peek_byte(), Some(b'b'));
+
+    assert!(c.skip_byte(b'b'));
+    assert!(c.skip_byte(b'c'));
+    assert!(c.skip_byte(b'd'));
+    assert!(!c.skip_byte(b'd'));
+    assert!(c.is_empty());
+}
+
+#[test]
 fn peek_skips_exhausted_and_empty_chunks() {
     let chunks: &[&[u8]] = &[b"", b"x", b""];
     let c = cursor(chunks);
@@ -560,6 +581,29 @@ fn skip_while_any_skips_across_boundary() {
     let mut c = cursor(&[b" \t"]);
     assert_eq!(c.skip_while_any(b" \t"), 2);
     assert!(c.is_empty());
+}
+
+#[test]
+fn pieces_contains_any_searches_all_remaining_pieces() {
+    let p = pieces(&[b"abc", b"", b"\r\n", b"def"]);
+    assert!(p.contains_any(b"a")); // first byte of the first piece
+    assert!(p.contains_any(b"f")); // last byte of the last piece
+    assert!(p.contains_any(b"\r\n")); // memchr2 path
+    assert!(p.contains_any(b";=!@#d")); // bitmap path
+    assert!(!p.contains_any(b";:"));
+}
+
+#[test]
+fn pieces_contains_any_handles_empty_inputs_and_partial_consumption() {
+    assert!(!pieces(&[]).contains_any(b"x"));
+    assert!(!pieces(&[b"", b""]).contains_any(b"x"));
+    assert!(!pieces(&[b"abc"]).contains_any(b""));
+
+    let mut p = pieces(&[b"x", b"abc"]);
+    assert!(p.contains_any(b"x"));
+    p.next();
+    assert!(!p.contains_any(b"x"));
+    assert!(p.contains_any(b"a"));
 }
 
 // ---- Pieces ExactSizeIterator: span geometry ----

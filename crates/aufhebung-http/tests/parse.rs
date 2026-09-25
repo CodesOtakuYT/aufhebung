@@ -130,6 +130,18 @@ fn truncated_requests_report_incomplete() {
 }
 
 #[test]
+fn fragmented_header_without_colon_distinguishes_incomplete_from_malformed() {
+    let incomplete: [&[u8]; 2] = [b"GET /x HTTP/1.1\r\nHo", b"st"];
+    assert!(matches!(
+        Request::parse(&incomplete),
+        Err(Error::Incomplete)
+    ));
+
+    let malformed: [&[u8]; 3] = [b"GET /x HTTP/1.1\r\nHo", b"st\r", b"\n\r\n"];
+    assert!(matches!(Request::parse(&malformed), Err(Error::Malformed)));
+}
+
+#[test]
 fn malformed_requests_report_malformed() {
     let wires: [&[u8]; 7] = [
         b"\r\n\r\n",                                // empty request line

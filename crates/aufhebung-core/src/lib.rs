@@ -1103,6 +1103,26 @@ impl<'a> ChunkedCursor<'a, u8> {
         Some(byte)
     }
 
+    /// If the next byte is `byte`, consume it and return `true`; otherwise
+    /// leave the logical cursor position unchanged and return `false`.
+    ///
+    /// Exhausted and empty chunks are skipped before checking the byte.
+    #[inline]
+    pub fn skip_byte(&mut self, byte: u8) -> bool {
+        self.skip_exhausted();
+        let next = self
+            .chunks
+            .get(self.idx)
+            .and_then(|chunk| chunk.get(self.pos))
+            .copied();
+        if next == Some(byte) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Split off everything before the first occurrence of `byte` and return
     /// it as zero-copy [`Pieces`], advancing the cursor to the `byte`.
     ///
@@ -1203,7 +1223,8 @@ impl<'a> ChunkedCursor<'a, u8> {
 ///
 /// Byte spans also behave like their contiguous contents without collecting:
 /// they compare with `==` (including against byte-string literals such as
-/// `b"GET"`), implement [`Hash`], and can be parsed with
+/// `b"GET"`), implement [`Hash`], support byte-set membership with
+/// [`contains_any`](Pieces::contains_any), and can be parsed with
 /// [`parse_integer`](Pieces::parse_integer).
 pub struct Pieces<'a, T> {
     chunks: &'a [&'a [T]],
@@ -1350,6 +1371,29 @@ impl<'a> Pieces<'a, u8> {
     /// ```
     pub fn byte_len(&self) -> usize {
         (*self).map(|piece| piece.len()).sum()
+    }
+
+    /// Whether any remaining byte in the span belongs to `set`.
+    ///
+    /// The search crosses piece boundaries without flattening the span and
+    /// reflects its current iteration state. An empty set matches nothing.
+    /// Sets of one to three bytes use memchr's optimized routines; larger sets
+    /// use the 256-bit bitmap scan. No allocation occurs.
+    ///
+    /// ```
+    /// use aufhebung_core::ChunkedCursor;
+    ///
+    /// let span = ChunkedCursor::new(&[b"header", b"\r", b"\n"]).take_rest();
+    /// assert!(span.contains_any(b"\r\n"));
+    /// assert!(!span.contains_any(b";:"));
+    /// ```
+    pub fn contains_any(&self, set: &[u8]) -> bool {
+        if set.is_empty() {
+            return false;
+        }
+        let search = SetSearcher::new(set);
+        let mut pieces = *self;
+        pieces.any(|piece| search.find(piece).is_some())
     }
 
     /// Whether the span's bytes begin with `prefix`.

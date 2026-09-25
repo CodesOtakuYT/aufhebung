@@ -160,21 +160,15 @@ impl<'a> Request<'a> {
                 None => return Err(Error::Incomplete),
                 Some(_) => {
                     let name = c.take_until_byte(b':');
-                    match c.peek_byte() {
-                        Some(b':') => {
-                            let _ = c.next_byte();
-                        }
-                        None => {
-                            // no colon seen: if a line end slipped into the
-                            // span the field is malformed, otherwise the rest
-                            // of the line may still be on the way
-                            return Err(if pieces_contain_crlf(name) {
-                                Error::Malformed
-                            } else {
-                                Error::Incomplete
-                            });
-                        }
-                        Some(_) => return Err(Error::Malformed),
+                    if !c.skip_byte(b':') {
+                        // no colon seen: if a line end slipped into the span
+                        // the field is malformed, otherwise the rest of the
+                        // line may still be on the way
+                        return Err(if name.contains_any(b"\r\n") {
+                            Error::Malformed
+                        } else {
+                            Error::Incomplete
+                        });
                     }
                     if name.byte_len() == 0 {
                         return Err(Error::Malformed);
@@ -253,13 +247,12 @@ fn eof_or_malformed(c: &ChunkedCursor<'_, u8>) -> Error {
 
 /// Consume exactly one SP, the request-line field separator.
 fn expect_sp(c: &mut ChunkedCursor<'_, u8>) -> Result<(), Error> {
-    match c.peek_byte() {
-        Some(b' ') => {
-            let _ = c.next_byte();
-            Ok(())
-        }
-        None => Err(Error::Incomplete),
-        Some(_) => Err(Error::Malformed),
+    if c.skip_byte(b' ') {
+        Ok(())
+    } else if c.is_empty() {
+        Err(Error::Incomplete)
+    } else {
+        Err(Error::Malformed)
     }
 }
 
@@ -284,10 +277,4 @@ fn expect_line_end(c: &mut ChunkedCursor<'_, u8>) -> Result<(), Error> {
         None => Err(Error::Incomplete),
         Some(_) => Err(Error::Malformed),
     }
-}
-
-/// Whether any piece of `span` contains a CR or LF byte.
-fn pieces_contain_crlf(span: Pieces<'_, u8>) -> bool {
-    span.into_iter()
-        .any(|piece| piece.iter().any(|&b| b == b'\r' || b == b'\n'))
 }
