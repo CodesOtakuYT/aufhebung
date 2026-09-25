@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Compact Vulkan-shaped registry used when no external vk.xml is supplied. -->
+<registry>
+  <types>
+    <type category="struct" name="VkInstanceCreateInfo"/>
+  </types>
+  <commands>
+    <command successcodes="VK_SUCCESS" errorcodes="VK_ERROR_OUT_OF_HOST_MEMORY">
+      <proto>
+        <type>VkResult</type>
+        <name>vkCreateInstance</name>
+      </proto>
+      <param>
+        <type>const <name>VkInstanceCreateInfo</name>*</type>
+        <name>pCreateInfo</name>
+      </param>
+    </command>
+    <command>
+      <proto>
+        <type>void</type>
+        <name>vkDestroyInstance</name>
+      </proto>
+      <param>
+        <type><name>VkInstance</name></type>
+        <name>instance</name>
+      </param>
+    </command>
+    <command name="vkGetInstanceProcAddr" alias="vkGetInstanceProcAddrKHR"/>
+    <command name="vkEnumerateInstanceExtensionProperties" alias="vkEnumerateInstanceExtensionPropertiesKHR"/>
+    <command name="vkNameAttributeWins">
+      <proto>
+        <type>void</type>
+        <name>vkIgnoredProtoName</name>
+      </proto>
+    </command>
+    <command/>
+  </commands>
+  <require api="vulkan">
+    <command name="vkIgnoredRequireReference"/>
+  </require>
+  <comment>Entity references remain literal: &amp; is not expanded.</comment>
+</registry>

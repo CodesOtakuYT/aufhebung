@@ -159,6 +159,13 @@ prefixes and DTD contents literal and does not expand entity references. The
 umbrella crate re-exports the parser as `Parser`/`Event` and exposes its error
 as `XmlError`, since the HTTP add-on already owns the root-level `Error` name.
 
+The [`examples/vulkan.rs`](examples/vulkan.rs) demo reads the installed Vulkan
+registry in seven-byte chunks and prints one borrowed command name per
+`<command>` definition under `<commands>`, including alias commands (it ignores
+later `<require>` references). Run it with
+`cargo run --example vulkan`, or pass another registry and chunk size:
+`cargo run --example vulkan -- path/to/vk.xml 7`.
+
 ## Where this fits
 
 Concrete situations the crate is aimed at:
@@ -257,16 +264,19 @@ examples, and benchmarks, so `cargo test`, `cargo bench`, and
 
 ## Benchmarks
 
-Run with `cargo bench` ([`criterion`](https://docs.rs/criterion) 0.5.1, 100
-samples per benchmark). Median times; lower is better. All numbers are *on
-these benchmarks*, *on this machine*; no claims about other workloads are
-made.
+Run with `cargo bench` ([`criterion`](https://docs.rs/criterion) 0.5.1). Most
+benchmarks use 100 samples; the Vulkan XML comparison uses 10 in both its
+fixture and full-registry modes because the latter parses a multi-megabyte
+document. Median times; lower is better. All numbers are *on these
+benchmarks*, *on this machine*; no claims about other workloads are made.
 
 Methodology: Intel Core i5-10400F @ 2.90 GHz (x86_64), rustc 1.100.0-nightly,
 criterion 0.5.1 with default settings (100 samples, estimated measurement
-time), release-profile defaults — no `target-cpu=native`, no LTO. Where two
-parsers are compared they run on identical byte inputs and both sides are
-zero-allocation unless stated. Sources: `benches/*.rs`.
+time) for the original benchmarks; the Vulkan XML benchmark deliberately uses
+10 samples. Release-profile defaults — no `target-cpu=native`, no LTO. Where
+two parsers are compared they run on identical byte inputs; allocation and
+validation differences are called out in the relevant section. Sources:
+`benches/*.rs`.
 
 ### HTTP/1 request + header parsing (contiguous buffer)
 
@@ -309,6 +319,38 @@ boundary costs roughly 4 ns. Whether this trade is worth it depends entirely
 on whether your input arrives fragmented — the crate's position is that
 *accepting* fragmentation beats *paying to remove it*, which is what the
 streaming-fragmentation section below measures.
+
+### Vulkan XML command extraction
+
+`benches/xml_vulkan.rs` compares the command-name extraction used by
+`examples/vulkan.rs` with [`quick-xml`](https://docs.rs/quick-xml) 0.42's
+streaming `Reader`. It has a checked-in Vulkan-shaped fixture for portable runs;
+set `AUFHEBUNG_VULKAN_XML` to use a complete registry:
+
+```sh
+AUFHEBUNG_VULKAN_XML=/path/to/vk.xml cargo bench --bench xml_vulkan
+```
+
+Both implementations consume the complete document, extract only direct
+`<commands>/<command>` definitions, and stream a command count/checksum rather
+than printing. The setup assertions check flat and seven-byte results agree
+between parsers; the fixture also checks the expected five command names. The
+`flat` cases are the direct parser comparison. The `7-byte-chunks` cases
+measure the cost of presenting the same bytes through a `BufRead` adapter and
+the chunk list accepted by `aufhebung`; they are not a claim that quick-xml's
+normal file input is fragmented. The benchmark uses quick-xml's default
+attribute checks and preserves raw `&...;` text when hashing a name.
+
+On the installed 3.29 MB registry, a local 10-sample Criterion run measured:
+
+| input          | aufhebung | quick-xml |
+|----------------|-----------|-----------|
+| flat           | 22.62 ms  | 11.44 ms  |
+| 7-byte chunks  | 31.04 ms  | 19.96 ms  |
+
+These are parser/extractor timings, not a claim that the two crates implement
+the same validation surface; `aufhebung` also performs its structural checks
+and keeps values as raw bytes.
 
 ### Integer parsing
 
